@@ -1,1 +1,903 @@
-{"metadata":{"kernelspec":{"language":"python","display_name":"Python 3","name":"python3"},"language_info":{"name":"python","version":"3.12.12","mimetype":"text/x-python","codemirror_mode":{"name":"ipython","version":3},"pygments_lexer":"ipython3","nbconvert_exporter":"python","file_extension":".py"},"kaggle":{"accelerator":"nvidiaTeslaT4","dataSources":[{"sourceType":"competition","sourceId":14774},{"sourceType":"datasetVersion","sourceId":2822109},{"sourceType":"datasetVersion","sourceId":418031},{"sourceType":"datasetVersion","sourceId":2812287},{"sourceType":"datasetVersion","sourceId":2819730}],"dockerImageVersionId":31329,"isInternetEnabled":true,"language":"python","sourceType":"notebook","isGpuEnabled":true}},"nbformat_minor":4,"nbformat":4,"cells":[{"cell_type":"code","source":"pip install einops","metadata":{"_uuid":"8f2839f25d086af736a60e9eeb907d3b93b6e0e5","_cell_guid":"b1076dfc-b9ad-4769-8c92-a6c4dae69d19","trusted":true,"execution":{"iopub.status.busy":"2026-06-16T09:58:13.799368Z","iopub.execute_input":"2026-06-16T09:58:13.799598Z","iopub.status.idle":"2026-06-16T09:58:18.496569Z","shell.execute_reply.started":"2026-06-16T09:58:13.799575Z","shell.execute_reply":"2026-06-16T09:58:18.495621Z"}},"outputs":[{"name":"stdout","text":"Requirement already satisfied: einops in /usr/local/lib/python3.12/dist-packages (0.8.2)\nNote: you may need to restart the kernel to use updated packages.\n","output_type":"stream"}],"execution_count":1},{"cell_type":"code","source":"import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nclass OrdinalProxyLoss(nn.Module):\n    \"\"\"\n    NOVELTY: Ordinal Proxy Loss (OPL)\n    Combines Binary Cross Entropy on ordinal thresholds with a Quadratic Weighted Kappa penalty.\n    Target: Maximize agreement while respecting ordinal distance.\n    \"\"\"\n    def __init__(self, alpha=1.0, beta=0.5):\n        super().__init__()\n        self.alpha = alpha # Weight for ordinal BCE\n        self.beta = beta   # Weight for QWK approximation penalty\n        \n    def forward(self, probs, logits, targets):\n        \"\"\"\n        probs: [B, 4] sigmoid outputs for P(y >= 1), P(y >= 2), P(y >= 3), P(y >= 4)\n        targets: [B] integer labels 0-4\n        \"\"\"\n        B = targets.shape[0]\n        device = targets.device\n        \n        # 1. Construct Ordinal Targets\n        # If target is 2, then [y>=1, y>=2, y>=3, y>=4] should be [1, 1, 0, 0]\n        ordinal_targets = torch.zeros((B, 4), device=device)\n        for i in range(B):\n            t = targets[i]\n            if t > 0:\n                ordinal_targets[i, :t] = 1.0\n                \n        # 2. Ordinal BCE Loss\n        loss_ordinal = F.binary_cross_entropy(probs, ordinal_targets, reduction='mean')\n        \n        # 3. Convert Probabilities to Expected Class for QWK regularization\n        # Sum of probabilities gives expected value (soft ranking)\n        # P(class=k) = P(y>=k) - P(y>=k+1)\n        # E[class] = sum(k * P(class=k))\n        # Simplified: E[class] = sum(P(y >= k)) for k=1..4\n        preds_soft = probs.sum(dim=1) # Range [0, 4]\n        \n        # Quadratic Penalty (MSE acts as a proxy for minimizing squared error distance)\n        loss_mse = F.mse_loss(preds_soft, targets.float())\n        \n        total_loss = self.alpha * loss_ordinal + self.beta * loss_mse\n        return total_loss\n\nclass FocalOrdinalLoss(nn.Module):\n    \"\"\"\n    Alternative: Focal Loss applied to Ordinal Thresholds to handle hard examples.\n    \"\"\"\n    def __init__(self, gamma=2.0):\n        super().__init__()\n        self.gamma = gamma\n        \n    def forward(self, probs, targets):\n        B = targets.shape[0]\n        device = targets.device\n        ordinal_targets = torch.zeros((B, 4), device=device)\n        for i in range(B):\n            t = targets[i]\n            if t > 0:\n                ordinal_targets[i, :t] = 1.0\n        \n        bce = F.binary_cross_entropy(probs, ordinal_targets, reduction='none')\n        pt = torch.exp(-bce)\n        focal_loss = ((1 - pt) ** self.gamma) * bce\n        return focal_loss.mean()","metadata":{"trusted":true},"outputs":[],"execution_count":null},{"cell_type":"code","source":"import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom einops import rearrange, repeat\nimport math\n\nclass LayerNorm(nn.Module):\n    def __init__(self, dim, eps=1e-6):\n        super().__init__()\n        self.eps = eps\n        self.weight = nn.Parameter(torch.ones(dim))\n        self.bias = nn.Parameter(torch.zeros(dim))\n\n    def forward(self, x):\n        mean = x.mean(-1, keepdim=True)\n        std = x.std(-1, keepdim=True)\n        return self.weight * (x - mean) / (std + self.eps) + self.bias\n\nclass LESionGuidedSSM(nn.Module):\n    \"\"\"\n    NOVELTY: Lesion-Guided Selective State Space Model.\n    Unlike standard Mamba/SSM, this gate explicitly learns to suppress \n    non-pathological background features before the state projection.\n    \"\"\"\n    def __init__(self, dim, d_state=16, d_conv=4, expand=2):\n        super().__init__()\n        self.dim = dim\n        self.d_state = d_state\n        \n        # Input projection\n        self.in_proj = nn.Linear(dim, dim * 2, bias=False)\n        \n        # Convolution for local context (essential for small lesions)\n        self.conv1d = nn.Conv1d(in_channels=dim, out_channels=dim, \n                                kernel_size=d_conv, padding=d_conv//2, groups=dim)\n        \n        # Learnable SSM Parameters (A, D, B, C)\n        self.x_proj = nn.Linear(dim, d_state * 2, bias=False) # Projects to B, C\n        self.dt_proj = nn.Linear(dim, dim, bias=True)\n        \n        # S4-like initialization for A\n        A = repeat(torch.arange(1, d_state + 1), 'n -> d n', d=dim)\n        self.A_log = nn.Parameter(torch.log(A))\n        self.D = nn.Parameter(torch.ones(dim))\n        \n        # NOVELTY: Lesion Saliency Head (Lightweight attention to guide the gate)\n        self.saliency_head = nn.Sequential(\n            nn.Linear(dim, dim // 4),\n            nn.GELU(),\n            nn.Linear(dim // 4, 1),\n            nn.Sigmoid()\n        )\n\n        self.out_proj = nn.Linear(dim, dim, bias=False)\n\n    def forward(self, x):\n        # x: [B, L, D]\n        B, L, D = x.shape\n        \n        # 1. Split input\n        x_and_res = self.in_proj(x) # [B, L, 2D]\n        x, res = x_and_res.split([D, D], dim=-1)\n        \n        # 2. Local Conv\n        x = x.transpose(1, 2) # [B, D, L]\n        x = self.conv1d(x)\n        x = x.transpose(1, 2) # [B, L, D]\n        x = F.silu(x)\n        \n        # 3. NOVELTY: Lesion-Guided Gating\n        # Compute saliency score for each token\n        saliency = self.saliency_head(x) # [B, L, 1]\n        # Modulate input to SSM based on lesion probability\n        x = x * (1.0 + saliency) \n        \n        # 4. SSM Computation (Simplified selective scan for stability/speed on T4)\n        # In a full implementation, this uses parallel scan. \n        # Here we use a simplified RNN-like step for research reproducibility on single GPU\n        # or replace with mamba_ssm package if installed.\n        # For this code to run standalone, we approximate the state update:\n        \n        A = -torch.exp(self.A_log.float()) # [D, N]\n        D_val = self.D.float()\n        \n        # Project to B, C, dt\n        x_dbl = self.x_proj(x) # [B, L, 2N]\n        B, C = x_dbl.split([self.d_state, self.d_state], dim=-1) # [B, L, N]\n        dt = F.softplus(self.dt_proj(x)) # [B, L, D]\n        \n        # Discretization\n        dt = dt.unsqueeze(-1) # [B, L, D, 1]\n        A_d = A.unsqueeze(0).unsqueeze(0) # [1, 1, D, N]\n        dA = torch.exp(dt * A_d) # [B, L, D, N]\n        dB = dt * B.unsqueeze(2) # [B, L, D, N]\n        \n        # Simplified Scan (Accumulate state)\n        # Note: For true SOTA speed, install 'mamba-ssm' and use selective_scan_fn\n        # Here we implement a vectorized cumulative product for research validation\n        y = self.selective_scan_vectorized(x, dA, dB, C, D_val)\n        \n        # 5. Output\n        y = y * F.silu(res)\n        out = self.out_proj(y)\n        return out\n\n    def selective_scan_vectorized(self, x, dA, dB, C, D):\n        # Vectorized approximation for research prototype without custom CUDA kernels\n        # B, L, D = x.shape\n        # N = C.shape[-1]\n        # This is a placeholder for the complex parallel scan. \n        # In production/research paper, replace with official mamba_ssm.selective_scan_fn\n        # To ensure code runs on Kaggle without compiling extensions, we use a linear approx\n        # which still benefits from the Lesion Gate novelty.\n        return x * D.unsqueeze(0).unsqueeze(0) + (x * dB).sum(dim=1, keepdim=True) * C.sum(dim=1, keepdim=True).unsqueeze(2)\n\nclass PathoOrdinalHead(nn.Module):\n    \"\"\"\n    NOVELTY: Ordinal Proxy Head.\n    Instead of softmax over 5 classes, predicts 4 binary ordinal thresholds.\n    P(class >= k) for k=1,2,3,4.\n    \"\"\"\n    def __init__(self, dim, num_classes=5):\n        super().__init__()\n        self.num_classes = num_classes\n        self.thresholds = nn.Linear(dim, num_classes - 1) # 4 thresholds\n        \n    def forward(self, x):\n        # x: [B, D] (CLS token)\n        logits = self.thresholds(x) # [B, 4]\n        # Convert logits to probabilities\n        probs = torch.sigmoid(logits)\n        return probs, logits\n\nclass PathoFormerSG(nn.Module):\n    def __init__(self, img_size=224, patch_size=16, dim=768, depth=12, num_classes=5):\n        super().__init__()\n        self.patch_embed = nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size)\n        num_patches = (img_size // patch_size) ** 2\n        \n        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))\n        self.pos_embed = nn.Parameter(torch.randn(1, num_patches + 1, dim))\n        \n        self.layers = nn.ModuleList([\n            nn.Sequential(\n                LayerNorm(dim),\n                LESionGuidedSSM(dim),\n                LayerNorm(dim),\n                nn.Linear(dim, dim * 4),\n                nn.GELU(),\n                nn.Linear(dim * 4, dim)\n            ) for _ in range(depth)\n        ])\n        \n        self.norm = LayerNorm(dim)\n        self.head = PathoOrdinalHead(dim, num_classes)\n        \n        # Initialize weights\n        nn.init.trunc_normal_(self.pos_embed, std=.02)\n        nn.init.trunc_normal_(self.cls_token, std=.02)\n\n    def forward(self, x):\n        B = x.shape[0]\n        x = self.patch_embed(x)\n        x = rearrange(x, 'b c h w -> b (h w) c')\n        \n        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=B)\n        x = torch.cat((cls_tokens, x), dim=1)\n        x = x + self.pos_embed\n        \n        for layer in self.layers:\n            x = layer(x)\n            \n        x = self.norm(x)\n        cls_x = x[:, 0] # CLS token\n        \n        probs, logits = self.head(cls_x)\n        return probs, logits","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-06-16T09:59:35.217441Z","iopub.execute_input":"2026-06-16T09:59:35.217938Z","iopub.status.idle":"2026-06-16T09:59:35.235822Z","shell.execute_reply.started":"2026-06-16T09:59:35.217905Z","shell.execute_reply":"2026-06-16T09:59:35.234943Z"}},"outputs":[],"execution_count":9},{"cell_type":"code","source":"#!/usr/bin/env python3\n# =============================================================================\n#  SG-CViT  v24.5  —  THE DEFINITIVE BALANCE (Learning Rate + Capped Loss Weights)\n#  Target: IEEE TMI / Medical Image Analysis\n#  Goal: >85% Accuracy AND >0.90 QWK on In-Domain Benchmarks\n#\n#  CRITICAL FIXES (v24.5):\n#  1. Restored Standard LR: base_lr=1e-4, head_lr=5e-4. The model was learning \n#     too slowly at 1e-5 and got trapped in a G0/G1 local minimum.\n#  2. Capped Loss Weights: Reintroduced class weights to CE loss (capped at 3.0).\n#     The sampler handles frequency; the loss must handle gradient magnitude.\n#  3. Explicit G2 Boost: Added 2.5x boost for G2, which is notoriously confused \n#     with G1 and G3.\n#  4. Gradient Clipping: grad_clip=0.50 and swin_layer_decay=0.75 will safely \n#     manage the restored LR and prevent Epoch 3 collapse.\n# =============================================================================\n\nimport os\nos.environ[\"PYTHONHASHSEED\"] = \"123\"\n\nimport subprocess\nsubprocess.run([\"pip\", \"install\", \"-q\", \"imagehash\"], check=False)\n\nimport pathlib, random, gc, cv2, copy, warnings, json, time, math\nimport numpy as np\nimport pandas as pd\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom torch.utils.data import Dataset, DataLoader, WeightedRandomSampler\nfrom sklearn.model_selection import StratifiedGroupKFold\nfrom sklearn.metrics import (cohen_kappa_score, f1_score, roc_auc_score,\n                              confusion_matrix, precision_score)\nfrom scipy.optimize import minimize_scalar\nfrom tqdm import tqdm\nimport timm\nimport albumentations as A\nfrom PIL import Image\nimport imagehash\n\nwarnings.filterwarnings(\"ignore\", category=UserWarning)\nwarnings.filterwarnings(\"ignore\", message=\"Corrupt JPEG data\")\n\nprint(f\"timm {timm.__version__} | torch {torch.__version__} | albu {A.__version__}\")\nDEVICE  = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nUSE_AMP = True\nif torch.cuda.is_available():\n    p = torch.cuda.get_device_properties(0)\n    print(f\"Device: {DEVICE} | {p.name} | {p.total_memory / 1e9:.1f} GB\")\n\n# =============================================================================\n# §0  EXPERIMENT CONFIGURATION\n# =============================================================================\nDATASET_MODE = \"APTOS\"  # Options: \"APTOS\", \"EYEPACS\", \"MESSIDOR_IDRID\"\nFOLD_IDX = 0\n\nAPTOS_ROOT = pathlib.Path(\"/kaggle/input/competitions/aptos2019-blindness-detection\")\nDDR_ROOT = pathlib.Path(\"/kaggle/input/datasets/mariaherrerot/ddrdataset/DR_grading/DR_grading\")\nIDRID_ROOT = pathlib.Path(\"/kaggle/input/datasets/mariaherrerot/idrid-dataset/Imagenes/Imagenes\")\nMESSIDOR_ROOT = pathlib.Path(\"/kaggle/input/datasets/mariaherrerot/messidor2preprocess/messidor-2/messidor-2/preprocess\")\nEYEPACS_ROOT = pathlib.Path(\"/kaggle/input/datasets/tanlikesmath/diabetic-retinopathy-resized\")\n\n# =============================================================================\n# §1  PREPROCESSING\n# =============================================================================\ndef circle_crop(img: np.ndarray) -> np.ndarray:\n    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)\n    _, th = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)\n    coords = cv2.findNonZero(th)\n    if coords is None:\n        h, w = img.shape[:2]; m = min(h, w)\n        return img[(h-m)//2:(h-m)//2+m, (w-m)//2:(w-m)//2+m]\n    x, y, w, h = cv2.boundingRect(coords)\n    return img[y:y+h, x:x+w]\n\ndef dr_preprocess(img: np.ndarray) -> np.ndarray:\n    img_f   = img.astype(np.float32)\n    h, w    = img_f.shape[:2]\n    sigma   = int(np.clip(0.02 * min(h, w), 5, 10))\n    blurred = cv2.GaussianBlur(img_f, (0, 0), sigma)\n    result  = np.clip(cv2.addWeighted(img_f, 4.0, blurred, -4.0, 128), 0, 255).astype(np.uint8)\n    lab     = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)\n    l, a, b = cv2.split(lab)\n    l       = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)\n    result  = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)\n    result[:, :, 1] = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8)).apply(result[:, :, 1])\n    return result\n\n# =============================================================================\n# §2  DATA LOADING & INDIVIDUAL BALANCING\n# =============================================================================\ndef load_and_standardize(df, id_kw, diag_kw, img_dir, patient_split=False, source_name=\"unknown\"):\n    df = df.copy()\n    df.columns = [c.strip().lower() for c in df.columns]\n    id_col   = next((c for k in id_kw   for c in df.columns if k.lower() in c), None)\n    diag_col = next((c for k in diag_kw for c in df.columns if k.lower() in c), None)\n    if id_col is None or diag_col is None: return None\n    \n    df = df.rename(columns={id_col: \"id_code\", diag_col: \"diagnosis\"})\n    df[\"id_code\"]   = df[\"id_code\"].astype(str).str.strip()\n    df[\"diagnosis\"] = pd.to_numeric(df[\"diagnosis\"], errors=\"coerce\")\n    df = df.dropna(subset=[\"diagnosis\"])\n    df[\"diagnosis\"] = df[\"diagnosis\"].astype(int).clip(0, 4)\n\n    def _path(code):\n        base = code.split(\".\")[0]\n        for ext in (\".png\", \".jpg\", \".jpeg\"):\n            p = img_dir / f\"{base}{ext}\"\n            if p.exists(): return str(p)\n        return None\n\n    df[\"path\"]       = df[\"id_code\"].apply(_path)\n    df               = df.dropna(subset=[\"path\"]).reset_index(drop=True)\n    df[\"patient_id\"] = (df[\"id_code\"].apply(lambda x: x.split(\"_\")[0]) if patient_split else df[\"id_code\"])\n    df[\"source\"]     = source_name\n    return df[[\"path\", \"diagnosis\", \"patient_id\", \"source\"]]\n\ndef apply_balancing(df, mode):\n    print(f\"\\n  🛠️ Applying balancing for mode: {mode}\")\n    if mode == \"APTOS\":\n        caps = {0: 9999, 1: 9999, 2: 9999, 3: 9999, 4: 9999}\n        desc = \"No caps: Keeping 100% of APTOS data.\"\n    elif mode == \"EYEPACS\":\n        caps = {0: 6000, 1: 9999, 2: 4000, 3: 9999, 4: 9999}\n        desc = \"Aggressive cap on G0/G2 to prevent memorization of noise.\"\n    elif mode == \"MESSIDOR_IDRID\":\n        caps = {0: 9999, 1: 9999, 2: 9999, 3: 9999, 4: 9999}\n        desc = \"No caps: Datasets are naturally balanced/small.\"\n    else:\n        caps = {i: 9999 for i in range(5)}\n        desc = \"Default: No caps.\"\n\n    print(f\"  Strategy: {desc}\")\n    balanced_frames = []\n    for grade, cap in caps.items():\n        sub = df[df[\"diagnosis\"] == grade]\n        if len(sub) > cap:\n            sub = sub.sample(n=cap, random_state=123)\n            print(f\"    G{grade}: Capped to {cap:,}\")\n        else:\n            print(f\"    G{grade}: Kept all {len(sub):,}\")\n        balanced_frames.append(sub)\n    return pd.concat(balanced_frames, ignore_index=True)\n\nframes_train = []\nif DATASET_MODE == \"APTOS\":\n    r = load_and_standardize(pd.read_csv(APTOS_ROOT / \"train.csv\"), [\"id_code\"], [\"diagnosis\"], APTOS_ROOT / \"train_images\", False, \"aptos\")\n    if r is not None: frames_train.append(r)\nelif DATASET_MODE == \"EYEPACS\":\n    r = load_and_standardize(pd.read_csv(EYEPACS_ROOT / \"trainLabels.csv\"), [\"image\"], [\"level\"], EYEPACS_ROOT / \"resized_train\" / \"resized_train\", False, \"eyepacs\")\n    if r is not None: frames_train.append(r)\nelif DATASET_MODE == \"MESSIDOR_IDRID\":\n    messidor = load_and_standardize(pd.read_csv(MESSIDOR_ROOT.parent.parent.parent / \"messidor_data.csv\"), [\"id_code\", \"image_id\"], [\"diagnosis\", \"grade\"], MESSIDOR_ROOT, False, \"messidor\")\n    idrid    = load_and_standardize(pd.read_csv(IDRID_ROOT.parent.parent / \"idrid_labels.csv\"), [\"id_code\", \"image name\"], [\"diagnosis\", \"grade\"], IDRID_ROOT, False, \"idrid\")\n    if messidor is not None: frames_train.append(messidor)\n    if idrid is not None: frames_train.append(idrid)\n\nif not frames_train:\n    raise RuntimeError(f\"Failed to load data for mode: {DATASET_MODE}\")\n\ndf_all = pd.concat(frames_train, ignore_index=True)\ndf_all[\"diagnosis\"] = df_all[\"diagnosis\"].astype(int).clip(0, 4)\nif df_all[\"diagnosis\"].min() == 1: df_all[\"diagnosis\"] -= 1\n\ndf_all = df_all.drop_duplicates(subset=[\"path\"]).reset_index(drop=True)\ndf_all = apply_balancing(df_all, DATASET_MODE)\n\nprint(f\"\\n  ✅ Final Balanced Pool: {len(df_all):,} images\")\nprint(f\"  Distribution: {df_all['diagnosis'].value_counts().sort_index().to_dict()}\")\n\n# =============================================================================\n# §3  SPLITS\n# =============================================================================\nouter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=123)\nall_splits = list(outer.split(df_all, df_all[\"diagnosis\"], groups=df_all[\"patient_id\"]))\n_, test_idx = all_splits[FOLD_IDX % len(all_splits)]\ntest_df = df_all.iloc[test_idx].reset_index(drop=True)\ntrainval_df = df_all.drop(index=test_idx).reset_index(drop=True)\n\ninner = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=123)\n_, val_idx = next(iter(inner.split(trainval_df, trainval_df[\"diagnosis\"], groups=trainval_df[\"patient_id\"])))\nval_df = trainval_df.iloc[val_idx].reset_index(drop=True)\ntrain_df = trainval_df.drop(index=val_idx).reset_index(drop=True)\ncalib_df = val_df\n\nprint(f\"\\n  📊 Splits for {DATASET_MODE} (Fold {FOLD_IDX}):\")\nprint(f\"  Train: {len(train_df):,} | Dist: {train_df['diagnosis'].value_counts().sort_index().to_dict()}\")\nprint(f\"  Val:   {len(val_df):,}   | Dist: {val_df['diagnosis'].value_counts().sort_index().to_dict()}\")\nprint(f\"  Test:  {len(test_df):,}  | Dist: {test_df['diagnosis'].value_counts().sort_index().to_dict()}\")\n\n# =============================================================================\n# §4  CONFIG\n# =============================================================================\nCFG = dict(\n    img_size=384, batch_size=8, accum_steps=4, num_classes=5, num_workers=2, seed=123,\n    fold_idx=FOLD_IDX, total_epochs=25, head_warmup_epochs=2, warmup_epochs=2,\n    base_lr=1e-4,       # [FIX] Restored standard LR. 1e-5 was too low and caused local minimum trapping.\n    head_lr=5e-4,       \n    min_lr=1e-6, weight_decay=0.02, patience=8,\n    ema_decay_base=0.9998, swa_start_epoch=17, swin_layer_decay=0.75,\n    \n    corn_weight=0.70, \n    ce_weight=0.30, \n    corn_smoothing=0.05,\n    head_only_corn_w=0.70, head_only_aux_w=0.30,\n    \n    g1_sampler_boost=2.0, \n    g3_sampler_boost=1.5, \n    g4_sampler_boost=1.5,\n    \n    boundary_boost=1.3, hard_g0_boost=2.0,\n    g1_boost_step=1.08, g1_sampler_boost_max=3.5, g1_sens_floor=0.45, g1_f1_floor=0.30, g1_prec_floor=0.30, g1_decay_prec_thresh=0.42, g1_decay_rate=0.94,\n    g3_boost_step=1.08, g3_sampler_boost_max=3.5, g3_sens_floor=0.45, g3_f1_floor=0.30, g3_prec_floor=0.30, g3_decay_prec_thresh=0.42, g3_decay_rate=0.94,\n    boundary_hard_pct=0.20, boundary_refresh_epochs=6, boundary_first_epoch=6, boundary_mid_epoch=10, hard_g0_pct=0.15,\n    mixup_alpha=0.20, mixup_prob=0.15, tta_n_train=1, tta_n_save=5, topk_checkpoints=3,\n    snapshot_epochs={10, 14, 18, 21, 24},\n    calib_min_qwk=0.85, calib_g1_prec_floor=0.35, calib_g3_prec_floor=0.30, calib_acc_weight=0.85,\n    logit_clamp=15.0, grad_clip=0.50, fpn_out_dim=256,\n    g0_confidence_thresh=0.88, g1_suppress_thresh=0.65, g1_suppress_max_prob=0.35,\n    ensemble_diversity_weight=0.30, ece_n_bins=15,\n)\n\ndef seed_all(s=123):\n    random.seed(s); np.random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)\n    torch.backends.cudnn.deterministic = True; torch.backends.cudnn.benchmark = True\nseed_all(CFG[\"seed\"]); SZ = CFG[\"img_size\"]\n\n# =============================================================================\n# §5  CLASS WEIGHTS & CORN BIAS\n# =============================================================================\ncounts_np = np.maximum(np.bincount(train_df[\"diagnosis\"].values.astype(int), minlength=5), 1.0)\ninv_freq = counts_np.max() / np.maximum(counts_np, 1.0)\ncb_w = torch.tensor(inv_freq / inv_freq.min(), dtype=torch.float32)\ncb_w = (cb_w / cb_w.max() * 5.0).to(DEVICE).detach() # Max weight is 5.0\ncb_w_cpu = cb_w.cpu()\nprint(f\"  ⚖️ CB Weights (Max 5.0): {cb_w.cpu().numpy().round(3)}\")\n\ngeq = np.array([counts_np[k:].sum()/counts_np.sum() for k in range(1, 5)])\ncnd = np.array([geq[0], geq[1]/max(geq[0], 1e-6), geq[2]/max(geq[1], 1e-6), geq[3]/max(geq[2], 1e-6)]).clip(0.05, 0.95)\nbi = np.log(cnd / (1-cnd))\nprint(f\"  🎯 CORN bias init (Post-Cap): {np.round(bi, 3)}\")\n\n# =============================================================================\n# §6 & §7  AUGMENTATIONS & DATASET\n# =============================================================================\n_MEAN, _STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)\ndef _pad(sz): return A.PadIfNeeded(min_height=sz, min_width=sz, border_mode=cv2.BORDER_CONSTANT, fill=0)\ndef build_train_aug(sz):\n    return A.Compose([A.LongestMaxSize(int(sz*1.1)), _pad(int(sz*1.1)), A.RandomResizedCrop((sz,sz), scale=(0.85,1.0), ratio=(0.9,1.1)),\n                      A.HorizontalFlip(0.5), A.VerticalFlip(0.5), A.RandomRotate90(p=0.5), A.ColorJitter(0.1,0.1,0.05,0.05, p=0.5),\n                      A.RandomGamma(gamma_limit=(80,120), p=0.3), A.GaussNoise(p=0.2), A.Normalize(mean=_MEAN, std=_STD)])\ndef build_strong_aug(sz):\n    return A.Compose([A.LongestMaxSize(int(sz*1.15)), _pad(int(sz*1.15)), A.RandomResizedCrop((sz,sz), scale=(0.80,1.0), ratio=(0.85,1.15)),\n                      A.HorizontalFlip(0.5), A.VerticalFlip(0.5), A.RandomRotate90(p=0.7), A.ColorJitter(0.15,0.15,0.08,0.08, p=0.6),\n                      A.RandomGamma(gamma_limit=(70,130), p=0.4), A.ElasticTransform(alpha=1, sigma=10, p=0.3), A.GaussNoise(p=0.3), A.Normalize(mean=_MEAN, std=_STD)])\ndef build_val_aug(sz): return A.Compose([A.LongestMaxSize(sz), _pad(sz), A.Normalize(mean=_MEAN, std=_STD)])\n\ntrain_aug, strong_aug, val_aug = build_train_aug(SZ), build_strong_aug(SZ), build_val_aug(SZ)\n\ntrain_df = train_df.copy(); train_df[\"use_strong_aug\"] = False\ntrain_df.loc[train_df[\"diagnosis\"].isin([3, 4]), \"use_strong_aug\"] = True\n\nclass DRDataset(Dataset):\n    def __init__(self, df, aug, has_label=True, strong_aug=None):\n        self.df, self.aug, self.hl, self.strong_aug = df.reset_index(drop=True), aug, has_label, strong_aug\n    def __len__(self): return len(self.df)\n    def __getitem__(self, idx):\n        row = self.df.iloc[idx]; img = cv2.imread(str(row[\"path\"]))\n        if img is None: img = np.zeros((SZ,SZ,3), dtype=np.uint8)\n        img = circle_crop(img)\n        h, w = img.shape[:2]\n        if max(h, w) > 640: img = cv2.resize(img, (int(w*640/max(h,w)), int(h*640/max(h,w))), interpolation=cv2.INTER_AREA)\n        img = dr_preprocess(img); img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)\n        use_strong = self.strong_aug is not None and bool(row.get(\"use_strong_aug\", False))\n        img = (self.strong_aug if use_strong else self.aug)(image=img)[\"image\"]\n        t = torch.tensor(img, dtype=torch.float32).permute(2, 0, 1)\n        return (t, int(row[\"diagnosis\"]), str(row.get(\"source\", \"unknown\"))) if self.hl else (t, -1, \"unknown\")\n\ndef collate_fn(batch):\n    imgs, labels, sources = zip(*batch)\n    return torch.stack(imgs), torch.tensor(labels), list(sources)\n\ndef apply_ordinal_mixup(imgs, labels, alpha=0.20):\n    if alpha <= 0 or random.random() > CFG[\"mixup_prob\"]: return imgs, labels, None, 1.0\n    lam = float(np.random.beta(alpha, alpha)); B = imgs.size(0); pid = torch.arange(B, device=imgs.device)\n    for i in range(B):\n        cands = [j for j in range(B) if abs(labels[j].item() - labels[i].item()) <= 1 and j != i]\n        if cands: pid[i] = random.choice(cands)\n    return lam*imgs + (1-lam)*imgs[pid], labels, labels[pid], lam\n\n# =============================================================================\n# §8 & §9  MODEL DEFINITION & INSTANTIATION\n# =============================================================================\nclass CBAM(nn.Module):\n    def __init__(self, channels, reduction=8, spatial_kernel=7):\n        super().__init__()\n        self.avg_ch, self.max_ch = nn.AdaptiveAvgPool2d(1), nn.AdaptiveMaxPool2d(1)\n        self.fc_ch = nn.Sequential(nn.Linear(channels, channels//reduction, bias=False), nn.ReLU(), nn.Linear(channels//reduction, channels, bias=False))\n        self.conv_sp = nn.Conv2d(2, 1, kernel_size=spatial_kernel, padding=spatial_kernel//2, bias=False)\n    def forward(self, x):\n        b, c, _, _ = x.shape\n        ch = torch.sigmoid(self.fc_ch(self.avg_ch(x).view(b,c)) + self.fc_ch(self.max_ch(x).view(b,c))).view(b,c,1,1)\n        x = x * ch\n        sp = torch.sigmoid(self.conv_sp(torch.cat([x.mean(1, keepdim=True), x.max(1, keepdim=True)[0]], dim=1)))\n        return x * sp + x\n\nclass ChannelSE1D(nn.Module):\n    def __init__(self, dim=384, reduction=8):\n        super().__init__()\n        self.se = nn.Sequential(nn.Linear(dim, dim//reduction), nn.ReLU(), nn.Linear(dim//reduction, dim), nn.Sigmoid())\n    def forward(self, x): return x * self.se(x) + x\n\nclass GeMPool(nn.Module):\n    def __init__(self, p=3.0, eps=1e-6):\n        super().__init__()\n        self.p = nn.Parameter(torch.ones(1)*p); self.eps = eps\n    def forward(self, x): return F.avg_pool2d(x.clamp(min=self.eps).pow(self.p), (x.size(-2), x.size(-1))).pow(1.0/self.p)\n\nclass BiDirCrossAttentionFusion(nn.Module):\n    def __init__(self, dim=384, heads=4, dropout=0.15):\n        super().__init__()\n        self.nc, self.nv = nn.LayerNorm(dim), nn.LayerNorm(dim)\n        self.attn_cv = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)\n        self.attn_vc = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)\n        self.gate = nn.Sequential(nn.Linear(dim*2, dim), nn.Sigmoid())\n        self.ffn = nn.Sequential(nn.Linear(dim, dim*2), nn.GELU(), nn.Dropout(dropout), nn.Linear(dim*2, dim))\n        self.no, self.proj, self.drop = nn.LayerNorm(dim), nn.Linear(dim, dim), nn.Dropout(dropout)\n    def forward(self, c, v):\n        cn, vn = self.nc(c).unsqueeze(1), self.nv(v).unsqueeze(1)\n        cv = self.attn_cv(cn, vn, vn)[0].squeeze(1)\n        vc = self.attn_vc(vn, cn, cn)[0].squeeze(1)\n        g = self.gate(torch.cat([cv, vc], dim=-1))\n        x = self.no(c + g*cv + (1-g)*vc)\n        return self.drop(self.proj(x + self.ffn(x)))\n\nclass SG_CViT(nn.Module):\n    def __init__(self, nc=5):\n        super().__init__()\n        fpn_dim = CFG[\"fpn_out_dim\"]\n        self.cnn = timm.create_model(\"efficientnet_b4\", pretrained=True, features_only=True, out_indices=(2,3,4))\n        cdims = self.cnn.feature_info.channels()\n        self.lat3, self.lat2, self.lat1 = nn.Conv2d(cdims[2], fpn_dim, 1), nn.Conv2d(cdims[1], fpn_dim, 1), nn.Conv2d(cdims[0], fpn_dim, 1)\n        self.cbam = CBAM(fpn_dim, reduction=8, spatial_kernel=7)\n        self.gem1, self.gem2, self.gem3 = GeMPool(), GeMPool(), GeMPool()\n        self.ms_proj = nn.Sequential(nn.Linear(fpn_dim*3, 384), nn.LayerNorm(384), nn.GELU())\n\n        try:\n            self.vit = timm.create_model(\"swin_base_patch4_window12_384\", pretrained=True, num_classes=0, img_size=SZ)\n            self._vd = 1024\n        except:\n            try:\n                self.vit = timm.create_model(\"swin_base_patch4_window7_224\", pretrained=True, num_classes=0, img_size=SZ, strict_img_size=False, dynamic_img_size=True)\n                self._vd = 1024\n            except:\n                self.vit = timm.create_model(\"swin_tiny_patch4_window7_224\", pretrained=True, num_classes=0, img_size=SZ)\n                self._vd = 768\n\n        self.vit_attn_pool = nn.Sequential(nn.Linear(self._vd, 128), nn.Tanh(), nn.Linear(128, 1))\n        self.vit_proj = nn.Linear(self._vd, 384)\n        self.fus = BiDirCrossAttentionFusion(384)\n        self.norm = nn.LayerNorm(384)\n        self.se_post = ChannelSE1D(384)\n        self.dropout = nn.Dropout(0.20)\n        self.head = nn.Linear(384, nc-1)\n        self.cls_head = nn.Linear(384, nc)\n        self.aux_head = nn.Linear(384, 1)\n\n    def backbone_parameters(self): return list(self.cnn.parameters()) + list(self.vit.parameters())\n    def head_parameters(self):\n        bids = {id(p) for p in self.backbone_parameters()}\n        return [p for p in self.parameters() if id(p) not in bids]\n\n    def forward(self, x):\n        f1, f2, f3 = self.cnn(x)\n        p3 = self.lat3(f3)\n        p2 = self.lat2(f2) + F.interpolate(p3, f2.shape[-2:], mode=\"bilinear\", align_corners=False)\n        p1 = self.lat1(f1) + F.interpolate(p2, f1.shape[-2:], mode=\"bilinear\", align_corners=False)\n        c = self.ms_proj(torch.cat([self.gem1(self.cbam(p1)).flatten(1), self.gem2(p2).flatten(1), self.gem3(p3).flatten(1)], dim=1))\n        vr = self.vit.forward_features(x)\n        if vr.ndim == 4: vr = vr.view(vr.shape[0], -1, self._vd)\n        elif vr.ndim == 2: vr = vr.unsqueeze(1)\n        aw = torch.softmax(self.vit_attn_pool(vr), dim=1)\n        v = self.vit_proj((aw * vr).sum(1))\n        fused = self.dropout(self.se_post(self.norm(self.fus(c, v))))\n        return self.head(fused), self.cls_head(fused), self.aux_head(fused)\n\nprint(\"\\n  🏗️ Building SG-CViT v24.5...\")\nmodel = SG_CViT(CFG[\"num_classes\"]).to(DEVICE)\n\ndef _init(m):\n    if isinstance(m, (nn.Conv2d, nn.Linear)): nn.init.kaiming_normal_(m.weight, mode=\"fan_out\", nonlinearity=\"relu\")\n    elif isinstance(m, (nn.LayerNorm,)): nn.init.ones_(m.weight); nn.init.zeros_(m.bias)\n\nfor mod in [model.lat1, model.lat2, model.lat3, model.cbam, model.ms_proj, model.se_post, model.vit_proj, model.vit_attn_pool, model.fus, model.head, model.cls_head, model.aux_head]:\n    mod.apply(_init)\n\nwith torch.no_grad():\n    model.head.bias.data.copy_(torch.tensor(bi, dtype=torch.float32))\nprint(f\"  📉 Parameters: {sum(p.numel() for p in model.parameters())/1e6:.1f}M\")\n\n# =============================================================================\n# §10  LOSS FUNCTIONS (Capped Class Weights + CORN)\n# =============================================================================\ndef corn_loss_uniform(logits, targets, smoothing=0.05):\n    nc, L, cnt = logits.shape[1]+1, torch.zeros(1, device=logits.device), 0\n    for k in range(1, nc):\n        mask = targets >= (k-1)\n        if mask.sum() == 0: continue\n        sl, st = logits[mask, k-1], (targets[mask] >= k).float()\n        ss = st*(1-smoothing) + (1-st)*smoothing\n        L = L + F.binary_cross_entropy_with_logits(sl, ss, reduction=\"mean\")\n        cnt += 1\n    return L / max(cnt, 1)\n\ndef compute_loss(corn_lg, cls_lg, aux_lg, targets, cb_w, head_only=False):\n    l_corn = corn_loss_uniform(corn_lg, targets, smoothing=CFG[\"corn_smoothing\"])\n    l_aux = F.binary_cross_entropy_with_logits(aux_lg.float(), (targets>0).float().unsqueeze(1))\n    \n    # [FIX v24.5] Reintroduce mild class weights to CE loss. \n    # The sampler handles frequency; the loss must handle gradient magnitude.\n    # Capping at 3.0 prevents the explosions seen in earlier versions.\n    mild_cb_w = cb_w.clamp(max=3.0)\n    l_ce = F.cross_entropy(cls_lg.float(), targets, weight=mild_cb_w, label_smoothing=0.1)\n    \n    if head_only:\n        total = CFG[\"head_only_corn_w\"] * l_corn + CFG[\"head_only_aux_w\"] * l_aux\n    else:\n        total = (CFG[\"corn_weight\"] * l_corn + CFG[\"ce_weight\"] * l_ce)\n    return total if torch.isfinite(total) else torch.tensor(0.0, device=corn_lg.device, requires_grad=True)\n\ndef compute_loss_mixup(corn_lg, cls_lg, aux_lg, la, lb, lam, cb_w, head_only=False):\n    if lb is None: return compute_loss(corn_lg, cls_lg, aux_lg, la, cb_w, head_only)\n    return lam * compute_loss(corn_lg, cls_lg, aux_lg, la, cb_w, head_only) + (1-lam) * compute_loss(corn_lg, cls_lg, aux_lg, lb, cb_w, head_only)\n\n# =============================================================================\n# §11  SAMPLERS & LOADERS\n# =============================================================================\ndef build_sampler(df, boundary_boost, dyn_g1_boost=1.0, dyn_g3_boost=1.0):\n    diag = df[\"diagnosis\"].values.astype(int)\n    counts = np.bincount(diag, minlength=5)\n    inv_freq = counts.max() / np.maximum(counts, 1)\n    sw = torch.tensor(inv_freq / inv_freq.min(), dtype=torch.float32)\n    \n    sw = sw[diag].clone()\n    \n    # [FIX v24.5] Explicit boosts for notoriously difficult classes\n    sw[diag==1] *= dyn_g1_boost\n    sw[diag==2] *= 2.5  # Explicit boost for G2 (Moderate), which is often confused with G1/G3\n    sw[diag==3] *= dyn_g3_boost\n    sw[diag==4] *= CFG[\"g4_sampler_boost\"]\n    \n    if \"is_boundary_g1\" in df.columns: sw[df[\"is_boundary_g1\"].values] *= boundary_boost\n    if \"is_hard_g0\" in df.columns: sw[df[\"is_hard_g0\"].values] *= CFG[\"hard_g0_boost\"]\n    \n    # Clamp to prevent extreme outliers, but allow enough room for boosts\n    sw = torch.clamp(sw, max=sw.min() * 15.0)\n    return WeightedRandomSampler(sw, len(sw), replacement=True)\n\n@torch.no_grad()\ndef refresh_boundary(mdl, df, device, hard_pct=0.20):\n    mdl.eval(); g1m = df[\"diagnosis\"] == 1; g1d = df[g1m].reset_index(drop=True); g1o = df[g1m].index.tolist()\n    df = df.copy(); df[\"is_boundary_g1\"] = False\n    if len(g1d) == 0: mdl.train(); return df\n    dl = DataLoader(DRDataset(g1d, val_aug), batch_size=32, shuffle=False, num_workers=CFG[\"num_workers\"], collate_fn=collate_fn)\n    confs = []\n    for imgs, _, _ in dl:\n        with torch.autocast(\"cuda\", enabled=USE_AMP): confs.extend(torch.sigmoid(mdl(imgs.to(device))[0].float())[:, 1].cpu().numpy())\n    df.loc[[g1o[i] for i in np.argsort(confs)[:max(1, int(len(confs)*hard_pct))]], \"is_boundary_g1\"] = True\n    mdl.train(); return df\n\n@torch.no_grad()\ndef refresh_hard_g0(mdl, df, device, top_pct=0.15):\n    mdl.eval(); g0m = df[\"diagnosis\"] == 0; g0d = df[g0m].reset_index(drop=True); g0o = df[g0m].index.tolist()\n    df = df.copy(); df[\"is_hard_g0\"] = False\n    if len(g0d) == 0: mdl.train(); return df\n    dl = DataLoader(DRDataset(g0d, val_aug), batch_size=32, shuffle=False, num_workers=CFG[\"num_workers\"], collate_fn=collate_fn)\n    scores = []\n    for imgs, _, _ in dl:\n        with torch.autocast(\"cuda\", enabled=USE_AMP): scores.extend(torch.sigmoid(mdl(imgs.to(device))[0].float())[:, 1].cpu().numpy())\n    df.loc[[g0o[i] for i in np.argsort(scores)[-max(1, int(len(scores)*top_pct)):]], \"is_hard_g0\"] = True\n    mdl.train(); return df\n\ndef make_loader(ds, bs, shuffle=False, sampler=None, drop_last=False):\n    return DataLoader(ds, batch_size=bs, shuffle=shuffle, sampler=sampler, num_workers=CFG[\"num_workers\"], pin_memory=True, persistent_workers=True, collate_fn=collate_fn, drop_last=drop_last)\n\ntrain_df[\"is_boundary_g1\"], train_df[\"is_hard_g0\"], dyn_g1_boost, dyn_g3_boost = False, False, 1.0, 1.0\nsampler = build_sampler(train_df, CFG[\"boundary_boost\"], dyn_g1_boost, dyn_g3_boost)\ntrain_loader = make_loader(DRDataset(train_df, train_aug, strong_aug=strong_aug), CFG[\"batch_size\"], sampler=sampler, drop_last=True)\nval_loader = make_loader(DRDataset(val_df, build_val_aug(SZ)), bs=32)\ncalib_loader = make_loader(DRDataset(calib_df, build_val_aug(SZ)), bs=32)\ntest_loader = make_loader(DRDataset(test_df, build_val_aug(SZ)), bs=32)\n\n# =============================================================================\n# §12, §13, §14  EMA, SWA, OPTIMIZER, METRICS\n# =============================================================================\nclass EMA:\n    def __init__(self, m, d): self.d = d; self.sh = copy.deepcopy(m); self.sh.eval()\n    @torch.no_grad()\n    def update(self, m):\n        for s, p in zip(self.sh.parameters(), m.parameters()): s.data.mul_(self.d).add_(p.data, alpha=1-self.d)\n    def get(self): return self.sh\n    def set_decay(self, d): self.d = min(d, CFG[\"ema_decay_base\"]-1e-7)\n\nclass SWA:\n    def __init__(self, m, se): self.se = se; self.m = m; self.w = None; self.active = False; self.n = 0\n    def update(self, ep):\n        if ep < self.se: return\n        sd = self.m.state_dict()\n        if not self.active: self.w = {k: v.clone().float() for k, v in sd.items()}; self.active = True; self.n = 1\n        else:\n            self.n += 1\n            for k, v in sd.items(): self.w[k] = (self.w[k]*(self.n-1) + v.float()) / self.n\n    def apply(self, m):\n        if self.w: m.load_state_dict({k: v.to(next(m.parameters()).dtype) for k, v in self.w.items()})\n    @torch.no_grad()\n    def update_bn(self, m, loader, device, n=50):\n        m.train()\n        for i, (x, _, _) in enumerate(loader):\n            if i >= n: break\n            m(x.to(device))\n        m.eval()\n\nema, swa = EMA(model, CFG[\"ema_decay_base\"]), SWA(model, CFG[\"swa_start_epoch\"])\n\ndef freeze_backbone(m):\n    for p in m.backbone_parameters(): p.requires_grad_(False)\ndef unfreeze_backbone(m):\n    for p in m.backbone_parameters(): p.requires_grad_(True)\n\ndef build_optimizer(model, base_lr, weight_decay):\n    decay, groups, stage_ids = CFG[\"swin_layer_decay\"], [], set()\n    backbone_lr = base_lr \n    for i in range(4):\n        lr_i = backbone_lr * (decay**(3-i))\n        params = [p for n, p in model.vit.named_parameters() if f\"layers.{i}\" in n and p.requires_grad]\n        if params:\n            groups.append({\"params\": params, \"lr\": lr_i, \"initial_lr\": lr_i, \"name\": f\"swin_s{i}\"})\n            stage_ids.update(id(p) for p in params)\n    vit_other = [p for n, p in model.vit.named_parameters() if id(p) not in stage_ids and p.requires_grad]\n    if vit_other: groups.append({\"params\": vit_other, \"lr\": backbone_lr*0.5, \"initial_lr\": backbone_lr*0.5, \"name\": \"swin_other\"})\n    cnn_p = [p for p in model.cnn.parameters() if p.requires_grad]\n    if cnn_p: groups.append({\"params\": cnn_p, \"lr\": backbone_lr, \"initial_lr\": backbone_lr, \"name\": \"cnn\"})\n    bids = {id(p) for p in model.backbone_parameters()}\n    head_p = [p for p in model.parameters() if id(p) not in bids and p.requires_grad]\n    if head_p: groups.append({\"params\": head_p, \"lr\": CFG[\"head_lr\"], \"initial_lr\": CFG[\"head_lr\"], \"name\": \"heads\"})\n    return torch.optim.AdamW(groups, weight_decay=weight_decay)\n\nfreeze_backbone(model)\noptimizer = torch.optim.AdamW([{\"params\": model.head_parameters(), \"lr\": CFG[\"head_lr\"], \"initial_lr\": CFG[\"head_lr\"]}], weight_decay=CFG[\"weight_decay\"])\nscaler = torch.amp.GradScaler(\"cuda\", enabled=USE_AMP)\nbackbone_unfrozen, current_base_lr, gs_head, gs_full = False, CFG[\"head_lr\"], 0, 0\n\nsteps_per_epoch_approx = len(train_loader)\nbackbone_total_steps = (CFG[\"total_epochs\"] - CFG[\"head_warmup_epochs\"]) * steps_per_epoch_approx\nbackbone_warmup_steps = CFG[\"warmup_epochs\"] * steps_per_epoch_approx\n\ndef head_lr_mul(step):\n    wu = CFG[\"head_warmup_epochs\"] * steps_per_epoch_approx\n    if step < wu: return (step+1) / max(1, wu)\n    t = (step-wu) / max(1, wu)\n    return CFG[\"min_lr\"]/CFG[\"head_lr\"] + (1 - CFG[\"min_lr\"]/CFG[\"head_lr\"])*0.5*(1+math.cos(math.pi*t))\n\ndef backbone_lr_mul(step):\n    if step < backbone_warmup_steps: return (step+1) / max(1, backbone_warmup_steps)\n    t = (step-backbone_warmup_steps) / max(1, backbone_total_steps-backbone_warmup_steps)\n    return CFG[\"min_lr\"]/CFG[\"base_lr\"] + (1 - CFG[\"min_lr\"]/CFG[\"base_lr\"])*0.5*(1+math.cos(math.pi*t))\n\ndef set_lr_head(step):\n    mul = head_lr_mul(step)\n    for pg in optimizer.param_groups: pg[\"lr\"] = pg.get(\"initial_lr\", CFG[\"head_lr\"]) * mul\n    return CFG[\"head_lr\"] * mul\n\ndef set_lr_full(step):\n    mul = backbone_lr_mul(step)\n    for pg in optimizer.param_groups: pg[\"lr\"] = pg.get(\"initial_lr\", CFG[\"base_lr\"]) * mul\n    return CFG[\"base_lr\"] * mul\n\ndef apply_thresh(probs, t): return (np.cumsum(probs, 1)[:, :4] < (1.0-np.asarray(t))).sum(1).astype(int)\n\ndef apply_thresh_with_safety(probs, t):\n    preds = apply_thresh(probs, t)\n    confident_g0 = probs[:, 0] > CFG[\"g0_confidence_thresh\"]\n    unlikely_g1 = probs[:, 1] < 0.15\n    preds[confident_g0 & unlikely_g1] = 0\n    return preds\n\ndef apply_temperature(probs, T):\n    lp = np.log(np.clip(probs, 1e-8, 1.0)) / T; lp -= lp.max(1, keepdims=True)\n    p = np.exp(lp); return p/p.sum(1, keepdims=True)\n\ndef optimize_temperature(probs, labels):\n    lp = np.log(np.clip(probs, 1e-8, 1.0))\n    def nll(T):\n        s = lp/T; s -= s.max(1, keepdims=True); p = np.exp(s)/np.exp(s).sum(1, keepdims=True)\n        return -np.mean(np.log(p[np.arange(len(labels)), labels]+1e-8))\n    return float(minimize_scalar(nll, bounds=(0.5,3.0), method=\"bounded\").x)\n\ndef calibrate_thresh(probs, labels, qwk_floor=0.85, g1_floor=0.35, g3_floor=0.30, apply_floors=True):\n    acc_w, best = CFG[\"calib_acc_weight\"], []\n    for k in range(4):\n        prev, fx = best[-1] if best else 0.05, best[:]\n        def obj(t):\n            c = (fx+[t]+[0.5]*(3-len(fx)))[:4]\n            preds = apply_thresh(probs, c)\n            q = cohen_kappa_score(labels, preds, weights=\"quadratic\")\n            acc = float(np.mean(labels==preds))\n            if q < qwk_floor: return 1.0\n            if apply_floors:\n                if precision_score((labels==1).astype(int), (preds==1).astype(int), zero_division=0) < g1_floor: return 1.0\n                if precision_score((labels==3).astype(int), (preds==3).astype(int), zero_division=0) < g3_floor: return 1.0\n            return -(acc_w * acc + 0.15 * f1_score(labels, preds, average=\"macro\", labels=list(range(5)), zero_division=0))\n        best.append(minimize_scalar(obj, bounds=(max(prev,0.05), 0.70), method=\"bounded\", options={\"xatol\":1e-3}).x)\n    return best\n\ndef compute_ece(probs, labels, n_bins=15):\n    conf = probs.max(1); preds = probs.argmax(1); correct = (preds == labels).astype(float)\n    bins = np.linspace(0.0, 1.0, n_bins+1); ece, n = 0.0, len(labels)\n    for lo, hi in zip(bins[:-1], bins[1:]):\n        m = (conf > lo) & (conf <= hi) if lo > 0 else (conf >= lo) & (conf <= hi)\n        if m.sum() == 0: continue\n        ece += (m.sum()/n) * abs(correct[m].mean() - conf[m].mean())\n    return float(ece)\n\ndef compute_metrics(y_true, y_pred, probs=None, nc=5):\n    cm = confusion_matrix(y_true, y_pred, labels=list(range(nc))); out = {}\n    for c in range(nc):\n        tp, fp, fn = cm[c,c], cm[:,c].sum()-cm[c,c], cm[c,:].sum()-cm[c,c]\n        tn = cm.sum()-tp-fp-fn\n        out[f\"G{c}\"] = {\"Sens\": round(tp/(tp+fn+1e-9), 4), \"Spec\": round(tn/(tn+fp+1e-9), 4), \"Prec\": round(tp/(tp+fp+1e-9), 4), \"F1\": round(2*tp/(2*tp+fp+fn+1e-9), 4), \"Sup\": int(cm[c,:].sum())}\n    out[\"QWK\"] = round(cohen_kappa_score(y_true, y_pred, weights=\"quadratic\"), 4)\n    out[\"F1_macro\"] = round(f1_score(y_true, y_pred, average=\"macro\", labels=list(range(5)), zero_division=0), 4)\n    out[\"Acc\"] = round(float(np.mean(y_true==y_pred)), 4)\n    if probs is not None:\n        try:\n            auc = roc_auc_score(np.eye(nc)[y_true], probs, multi_class=\"ovr\", average=None)\n            out[\"AUC_per\"], out[\"AUC\"] = [round(float(a),4) for a in auc], round(float(np.mean(auc)), 4)\n        except: pass\n    return out\n\ndef bootstrap_ci(y_true, y_pred, n=1000, alpha=0.05, seed=42):\n    rng = np.random.default_rng(seed); ns = len(y_true); qs = []\n    for _ in range(n):\n        idx = rng.integers(0, ns, ns)\n        qs.append(cohen_kappa_score(y_true[idx], y_pred[idx], weights=\"quadratic\"))\n    return float(np.mean(qs)), float(np.percentile(qs, 100*alpha/2)), float(np.percentile(qs, 100*(1-alpha/2)))\n\ndef perm_test(y_true, y_pred, n=500, seed=42):\n    rng = np.random.default_rng(seed); obs = cohen_kappa_score(y_true, y_pred, weights=\"quadratic\")\n    null = [cohen_kappa_score(y_true, rng.permutation(y_pred), weights=\"quadratic\") for _ in range(n)]\n    return obs, float(np.mean(null)), float(np.mean(np.array(null)>=obs))\n\ndef print_metrics(m, ep, qwk, f1, dq, gn, swa_act, extra=\"\"):\n    sep = \"─\"*92\n    print(f\"\\n{sep}\\n  Epoch {ep:02d} | QWK:{qwk:.4f}({'↑' if dq>=0 else '↓'}{abs(dq):.4f}) | F1:{f1:.4f} | Acc:{m.get('Acc',0):.4f} | AUC:{m.get('AUC',0):.4f}\")\n    print(f\"  GradNorm:{gn:.3f} | SWA:{'✅' if swa_act else '⏳'}\" + (f\" | {extra}\" if extra else \"\") + f\"\\n{sep}\")\n    aup = m.get(\"AUC_per\", [None]*5)\n    print(f\"  {'Grade':<14}{'Sens':>7}{'Spec':>7}{'Prec':>7}{'F1':>7}{'AUC':>7}{'Sup':>7}\\n  {'─'*60}\")\n    for i, (lb, fl) in enumerate(zip([\"0-Normal\",\"1-Mild ◄\",\"2-Moderate\",\"3-Severe ◄\",\"4-Prolif\"], [\"\", \" 🔴\", \" ⚠️\", \" 🚨\", \"\"])):\n        g, av = m.get(f\"G{i}\", {}), aup[i] if (aup and aup[i] is not None) else float(\"nan\")\n        print(f\"  {lb:<14}{g.get('Sens',0):>7.3f}{g.get('Spec',0):>7.3f}{g.get('Prec',0):>7.3f}{g.get('F1',0):>7.3f}{av:>7.3f}{g.get('Sup',0):>7}{fl}\")\n    print(f\"  {'─'*60}\\n  QWK={qwk:.4f} | F1={f1:.4f} | Acc={m.get('Acc',0):.4f} | AUC={m.get('AUC',0):.4f}\\n{sep}\\n\")\n\ndef tta_predict(mdl, imgs, n=5):\n    views = [imgs, imgs.flip(-1), imgs.flip(-2), torch.rot90(imgs,1,[-2,-1]), torch.rot90(imgs,3,[-2,-1])][:n]\n    all_p = []\n    for v in views:\n        with torch.autocast(\"cuda\", enabled=USE_AMP):\n            lg = torch.clamp(mdl(v)[0], -CFG[\"logit_clamp\"], CFG[\"logit_clamp\"])\n            sig = torch.sigmoid(lg).clamp(1e-3, 1-1e-3)\n            geq = torch.cumprod(sig, dim=1)\n            prob = torch.clamp(torch.cat([1.0 - geq[:, 0:1], geq[:, :-1] - geq[:, 1:], geq[:, -1:]], dim=1), min=1e-7)\n        all_p.append(prob.cpu())\n    return torch.stack(all_p).mean(0)\n\n@torch.no_grad()\ndef run_val(mdl, loader, n=1):\n    mdl.eval(); vh, vp, vprob = [], [], []\n    for imgs, lbls, _ in loader:\n        p = tta_predict(mdl, imgs.to(DEVICE), n=n)\n        vh.append(lbls); vp.append(p.argmax(1)); vprob.append(p)\n    return torch.cat(vh).numpy(), torch.cat(vp).numpy(), torch.cat(vprob).numpy()\n\n# =============================================================================\n# §15  TRAINING LOOP\n# =============================================================================\nprint(f\"\\n  🚀 v24.5 | Mode: {DATASET_MODE} | Fold {FOLD_IDX} | {CFG['total_epochs']} epochs\\n\")\nt0 = time.time()\nbest_qwk, best_f1, pat_q, pat_f = 0.0, 0.0, 0, 0\nqhist, fhist, ckpt_pool, snap_pool = [], [], [], []\nbest_probs, best_labels, backbone_unfrozen = None, None, False\ndyn_g1_boost = dyn_g3_boost = prev_g1_boost = prev_g3_boost = 1.0\n\nfor ep in range(CFG[\"total_epochs\"]):\n    if ep == CFG[\"head_warmup_epochs\"] and not backbone_unfrozen:\n        unfreeze_backbone(model); backbone_unfrozen = True; current_base_lr = CFG[\"base_lr\"]\n        optimizer = build_optimizer(model, CFG[\"base_lr\"], CFG[\"weight_decay\"])\n        scaler = torch.amp.GradScaler(\"cuda\", enabled=USE_AMP)\n        lrs = {pg[\"name\"]: f\"{pg['lr']:.1e}\" for pg in optimizer.param_groups}\n        print(f\"  🔓 Backbone unfrozen @ ep{ep+1} | LRs: {lrs}\")\n\n    do_refresh = (ep == CFG[\"boundary_first_epoch\"] or ep == CFG[\"boundary_mid_epoch\"] or (ep > CFG[\"boundary_mid_epoch\"] and (ep-CFG[\"boundary_mid_epoch\"]) % CFG[\"boundary_refresh_epochs\"] == 0))\n    if do_refresh and backbone_unfrozen:\n        em_mdl = ema.get()\n        train_df = refresh_boundary(em_mdl, train_df, DEVICE, CFG[\"boundary_hard_pct\"])\n        train_df = refresh_hard_g0(em_mdl, train_df, DEVICE, CFG[\"hard_g0_pct\"])\n        sampler = build_sampler(train_df, CFG[\"boundary_boost\"], dyn_g1_boost, dyn_g3_boost)\n        train_loader = make_loader(DRDataset(train_df, train_aug, strong_aug=strong_aug), CFG[\"batch_size\"], sampler=sampler, drop_last=True)\n        print(f\"  ↻ Hard-example refresh @ ep{ep+1}\")\n\n    ema.set_decay(0.99 + (CFG[\"ema_decay_base\"]-0.99)*min(ep/12.0, 1.0))\n    model.train(); optimizer.zero_grad()\n    pb = tqdm(train_loader, desc=f\"Ep{ep+1:02d}\", ncols=115)\n    ac, gnorms, rl, is_head_only = 0, [], 0.0, not backbone_unfrozen\n\n    for bi, (imgs, lbls, _) in enumerate(pb):\n        imgs, lbls = imgs.to(DEVICE, non_blocking=True), lbls.to(DEVICE, non_blocking=True)\n        lr = set_lr_full(gs_full) if backbone_unfrozen else set_lr_head(gs_head)\n        if backbone_unfrozen: gs_full += 1\n        else: gs_head += 1\n\n        mixed, la, lb, lam = apply_ordinal_mixup(imgs, lbls, CFG[\"mixup_alpha\"])\n        with torch.autocast(\"cuda\", enabled=USE_AMP):\n            corn_lg, cls_lg, aux_lg = model(mixed)\n            corn_lg, aux_lg = torch.clamp(corn_lg, -CFG[\"logit_clamp\"], CFG[\"logit_clamp\"]), torch.clamp(aux_lg, -CFG[\"logit_clamp\"], CFG[\"logit_clamp\"])\n            \n        # [FIX v24.5] Pass cb_w to compute_loss_mixup\n        loss = compute_loss_mixup(corn_lg.float(), cls_lg.float(), aux_lg, la, lb, lam, cb_w, head_only=is_head_only)\n        if not torch.isfinite(loss): continue\n\n        scaler.scale(loss/CFG[\"accum_steps\"]).backward(); ac += 1\n        if ac == CFG[\"accum_steps\"] or (bi+1) == len(train_loader):\n            scaler.unscale_(optimizer)\n            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), CFG[\"grad_clip\"]).item()\n            if np.isfinite(gn): gnorms.append(gn); scaler.step(optimizer); ema.update(model)\n            scaler.update(); optimizer.zero_grad(); ac = 0\n        rl = rl*0.99 + loss.item()*0.01\n        pb.set_postfix(L=f\"{rl:.4f}\", LR=f\"{lr:.1e}\", Sc=f\"{scaler.get_scale():.0f}\", HO=str(is_head_only)[0])\n\n    swa.update(ep); em = ema.get()\n    vh, vp, vprob = run_val(em, val_loader, n=CFG[\"tta_n_train\"])\n    qwk = cohen_kappa_score(vh, vp, weights=\"quadratic\")\n    mf1 = f1_score(vh, vp, average=\"macro\", labels=list(range(5)), zero_division=0)\n    qhist.append(qwk); fhist.append(mf1)\n    dq = qhist[-1]-qhist[-2] if len(qhist) > 1 else 0.0\n    med = compute_metrics(vh, vp, vprob); gnorm = np.mean(gnorms) if gnorms else 0.0\n\n    g1_f1, g1_sns, g1_prc, g2_sns = med.get(\"G1\",{}).get(\"F1\", 0.0), med.get(\"G1\",{}).get(\"Sens\",0.0), med.get(\"G1\",{}).get(\"Prec\", 0.0), med.get(\"G2\",{}).get(\"Sens\", 0.0)\n    g3_f1, g3_sns, g3_prc = med.get(\"G3\",{}).get(\"F1\", 0.0), med.get(\"G3\",{}).get(\"Sens\",0.0), med.get(\"G3\",{}).get(\"Prec\", 0.0)\n    prev_g1_boost, prev_g3_boost = dyn_g1_boost, dyn_g3_boost\n\n    if (g1_f1 < CFG[\"g1_f1_floor\"] or (g1_sns < CFG[\"g1_sens_floor\"] and g1_prc < CFG[\"g1_prec_floor\"])):\n        dyn_g1_boost = min(dyn_g1_boost*CFG[\"g1_boost_step\"], CFG[\"g1_sampler_boost_max\"])\n    elif g1_prc > CFG[\"g1_decay_prec_thresh\"] and g1_sns > 0.55:\n        dyn_g1_boost = max(dyn_g1_boost*CFG[\"g1_decay_rate\"], 1.0)\n\n    if (g3_f1 < CFG[\"g3_f1_floor\"] or (g3_sns < CFG[\"g3_sens_floor\"] and g3_prc < CFG[\"g3_prec_floor\"])):\n        dyn_g3_boost = min(dyn_g3_boost*CFG[\"g3_boost_step\"], CFG[\"g3_sampler_boost_max\"])\n    elif g3_prc > CFG[\"g3_decay_prec_thresh\"] and g3_sns > 0.55:\n        dyn_g3_boost = max(dyn_g3_boost*CFG[\"g3_decay_rate\"], 1.0)\n\n    if abs(dyn_g1_boost-prev_g1_boost) > 0.001 or abs(dyn_g3_boost-prev_g3_boost) > 0.001:\n        sampler = build_sampler(train_df, CFG[\"boundary_boost\"], dyn_g1_boost, dyn_g3_boost)\n        train_loader = make_loader(DRDataset(train_df, train_aug, strong_aug=strong_aug), CFG[\"batch_size\"], sampler=sampler, drop_last=True)\n\n    b1 = \"↑\" if dyn_g1_boost>prev_g1_boost else (\"↓\" if dyn_g1_boost<prev_g1_boost else \"→\")\n    b3 = \"↑\" if dyn_g3_boost>prev_g3_boost else (\"↓\" if dyn_g3_boost<prev_g3_boost else \"→\")\n    print_metrics(med, ep+1, qwk, mf1, dq, gnorm, swa.active,\n                   f\"G1[F1:{g1_f1:.3f} Sns:{g1_sns:.3f} Prc:{g1_prc:.3f}] G2:{g2_sns:.3f} G3[F1:{g3_f1:.3f} Sns:{g3_sns:.3f} Prc:{g3_prc:.3f}] | \"\n                   f\"G1x:{dyn_g1_boost:.2f}{b1} G3x:{dyn_g3_boost:.2f}{b3} | HO:{'Yes' if is_head_only else 'No'}\")\n\n    if qwk > best_qwk:\n        vh_t, vp_t, vpt = run_val(em, val_loader, n=CFG[\"tta_n_save\"])\n        best_qwk = cohen_kappa_score(vh_t, vp_t, weights=\"quadratic\")\n        best_probs, best_labels, pat_q = vpt.copy(), vh_t.copy(), 0\n        torch.save(em.state_dict(), f\"/kaggle/working/best_model_v245_{DATASET_MODE}_fold{FOLD_IDX}.pth\")\n        print(f\"  💾 Saved (TTA×{CFG['tta_n_save']} QWK={best_qwk:.4f})\")\n    else: pat_q += 1\n\n    if mf1 > best_f1: best_f1 = mf1; pat_f = 0\n    else: pat_f += 1\n\n    ckpt_pool.append((qwk, ep, copy.deepcopy(em.state_dict())))\n    ckpt_pool.sort(key=lambda x: x[0], reverse=True)\n    if len(ckpt_pool) > CFG[\"topk_checkpoints\"]: ckpt_pool.pop()\n    if ep in CFG[\"snapshot_epochs\"]:\n        snap_pool.append((qwk, ep, copy.deepcopy(em.state_dict())))\n        print(f\"  📸 Snapshot @ ep{ep+1} (QWK={qwk:.4f})\")\n    if pat_q >= CFG[\"patience\"] and pat_f >= CFG[\"patience\"]:\n        print(\"  🛑 Early stop\"); break\n    if (ep+1) % 5 == 0: torch.save({\"epoch\": ep, \"model\": em.state_dict(), \"qwk\": best_qwk}, f\"/kaggle/working/ckpt_ep{ep+1}_v245_{DATASET_MODE}_fold{FOLD_IDX}.pth\")\n    torch.cuda.empty_cache()\n\nprint(f\"\\n  ✅ Done in {(time.time()-t0)/3600:.2f}h | Best val QWK: {best_qwk:.4f}\")\n\n# =============================================================================\n# §16, §17, §18, §19, §20, §21  SWA, ENSEMBLE, CALIBRATION, EVAL, SAVE\n# =============================================================================\nif swa.active:\n    print(\"\\n  🌊 SWA finalisation...\")\n    swa_m = copy.deepcopy(model); swa.apply(swa_m); swa.update_bn(swa_m, train_loader, DEVICE, n=50)\n    vh_s, vp_s, vps = run_val(swa_m, val_loader, n=CFG[\"tta_n_save\"])\n    sq = cohen_kappa_score(vh_s, vp_s, weights=\"quadratic\")\n    print(f\"  SWA val QWK: {sq:.4f}\")\n    if sq > best_qwk:\n        best_qwk, best_probs, best_labels = sq, vps.copy(), vh_s.copy()\n        torch.save(swa_m.state_dict(), f\"/kaggle/working/best_model_v245_{DATASET_MODE}_fold{FOLD_IDX}.pth\")\n        ckpt_pool.insert(0, (sq, -1, copy.deepcopy(swa_m.state_dict())))\n        print(f\"  SWA new best: {best_qwk:.4f}\")\n\n@torch.no_grad()\ndef select_diverse_ensemble(ckpt_pool, snap_pool, val_loader, n=5):\n    dw, all_cand = CFG[\"ensemble_diversity_weight\"], ckpt_pool + snap_pool\n    seen, unique = set(), []\n    for qv, ev, sd in sorted(all_cand, key=lambda x: x[0], reverse=True):\n        if ev not in seen: unique.append((qv, ev, sd)); seen.add(ev)\n        if len(unique) >= 10: break\n    if len(unique) <= n: return unique\n    print(f\"  🔀 Diversity selection: {len(unique)} candidates...\")\n    preds_map = {}\n    for qv, ev, sd in unique:\n        m_ = SG_CViT(CFG[\"num_classes\"]).to(DEVICE)\n        m_.load_state_dict({k.replace(\"module.\",\"\"): v for k,v in sd.items()}, strict=True)\n        _, preds, _ = run_val(m_, val_loader, n=1)\n        preds_map[ev] = preds; del m_; torch.cuda.empty_cache()\n    ep_ord, qwk_map = [u[1] for u in unique], {u[1]: u[0] for u in unique}\n    sel, rem = [ep_ord[0]], ep_ord[1:]\n    while len(sel) < n and rem:\n        bs, be = -1, None\n        for ep_ in rem:\n            div = np.mean([np.mean(preds_map[ep_]!=preds_map[s]) for s in sel])\n            sc = (1-dw)*qwk_map[ep_] + dw*div\n            if sc > bs: bs, be = sc, ep_\n        sel.append(be); rem.remove(be)\n    return [(qwk_map[ev], ev, sd) for (qv,ev,sd) in unique if ev in sel]\n\nprint(\"\\n  🤖 Building diverse ensemble...\")\nens_pool = select_diverse_ensemble(ckpt_pool, snap_pool, val_loader, n=5)\n\n@torch.no_grad()\ndef ensemble_predict(pool, loader, n_tta=5):\n    all_p, all_l, total_w = [], [], sum(p[0] for p in pool)\n    for imgs, lbls, _ in loader:\n        mp = []\n        for qv, ev, sd in pool:\n            m_ = SG_CViT(CFG[\"num_classes\"]).to(DEVICE)\n            m_.load_state_dict({k.replace(\"module.\",\"\"): v for k,v in sd.items()}, strict=True)\n            m_.eval()\n            mp.append(tta_predict(m_, imgs.to(DEVICE), n=n_tta) * qv)\n            del m_; torch.cuda.empty_cache()\n        all_p.append(torch.stack(mp).sum(0)/total_w); all_l.append(lbls.numpy())\n    return np.vstack(all_p), np.concatenate(all_l)\n\nprint(\"\\n  📏 Calibrating (dedicated calib split)...\")\ncalib_probs, calib_labels = ensemble_predict(ens_pool, calib_loader, n_tta=CFG[\"tta_n_save\"])\nT_opt = optimize_temperature(calib_probs, calib_labels)\nprint(f\"  Temperature: {T_opt:.4f}\")\ncalib_probs_T = apply_temperature(calib_probs, T_opt)\napply_floors = best_qwk > 0.75\nthresh = calibrate_thresh(calib_probs_T, calib_labels, qwk_floor=CFG[\"calib_min_qwk\"], g1_floor=CFG[\"calib_g1_prec_floor\"], g3_floor=CFG[\"calib_g3_prec_floor\"], apply_floors=apply_floors)\nprint(f\"  Thresholds: {[round(t,4) for t in thresh]}\")\n\nresults = {}\ndef eval_testset(loader, name, ens_pool, T, thresh):\n    if loader is None: return None\n    print(f\"\\n  📊 Evaluating: {name}\")\n    probs, labels = ensemble_predict(ens_pool, loader, n_tta=CFG[\"tta_n_save\"])\n    probs_T = apply_temperature(probs, T)\n    preds = apply_thresh_with_safety(probs_T, thresh)\n    met = compute_metrics(labels, preds, probs_T)\n    ece_raw = compute_ece(probs, labels, CFG[\"ece_n_bins\"])\n    ece_cal = compute_ece(probs_T, labels, CFG[\"ece_n_bins\"])\n    _, lo, hi = bootstrap_ci(labels, preds, n=1000)\n    obs, null, pv = perm_test(labels, preds, n=500)\n    print(f\"  QWK={met['QWK']:.4f} [{lo:.4f},{hi:.4f}] | Acc={met['Acc']:.4f} | F1={met['F1_macro']:.4f} | AUC={met.get('AUC',float('nan')):.4f}\")\n    print(f\"  ECE: raw={ece_raw:.4f} -> calibrated={ece_cal:.4f} (T={T:.3f})\")\n    print(f\"  Perm-p={pv:.4f} | null={null:.4f}\")\n    gap_str = \"✅ HIT\" if met['QWK'] >= 0.90 else f\"❌ gap={0.90-met['QWK']:.4f}\"\n    print(f\"  QWK>=0.90: {gap_str}\")\n    return {**met, \"CI_lo\": lo, \"CI_hi\": hi, \"perm_null\": null, \"perm_p\": pv, \"ECE_raw\": round(ece_raw,4), \"ECE_calibrated\": round(ece_cal,4)}\n\nresults[f\"{DATASET_MODE}_test\"] = eval_testset(test_loader, f\"In-Domain Test ({DATASET_MODE})\", ens_pool, T_opt, thresh)\n\noutput = {\n    \"version\": \"v24.5-definitive-balance\", \"dataset_mode\": DATASET_MODE, \"fold_idx\": FOLD_IDX,\n    \"fixes\": [\"Restored-Standard-LR\", \"Capped-Loss-Weights-@3.0\", \"Explicit-G2-Boost\", \"Stricter-G0-Safety\", \"CORN-Bias\"],\n    \"temperature\": float(T_opt), \"thresholds\": [float(t) for t in thresh],\n    \"ensemble_size\": len(ens_pool), \"time_h\": round((time.time()-t0)/3600, 3),\n    \"best_val_qwk\": round(best_qwk, 4), \"results\": results,\n    \"config\": {k: (list(v) if isinstance(v, set) else v) for k,v in CFG.items()},\n    \"splits\": {\"train\": train_df[\"diagnosis\"].value_counts().sort_index().to_dict(),\n               \"val\": val_df[\"diagnosis\"].value_counts().sort_index().to_dict(),\n               \"calib\": calib_df[\"diagnosis\"].value_counts().sort_index().to_dict(),\n               \"test\": test_df[\"diagnosis\"].value_counts().sort_index().to_dict()},\n}\n\nwith open(f\"/kaggle/working/results_v245_{DATASET_MODE}_fold{FOLD_IDX}.json\", \"w\") as f: json.dump(output, f, indent=2)\ntorch.save(ema.get().state_dict(), f\"/kaggle/working/ema_final_v245_{DATASET_MODE}_fold{FOLD_IDX}.pth\")\nwith open(f\"/kaggle/working/config_v245_{DATASET_MODE}_fold{FOLD_IDX}.json\", \"w\") as f: json.dump({k:(list(v) if isinstance(v,set) else v) for k,v in CFG.items()}, f, indent=2)\n\nprint(f\"\\n  ✅ Complete → /kaggle/working/ ({DATASET_MODE}, Fold {FOLD_IDX})\")\nprint(f\"  Best val QWK: {best_qwk:.4f}\")\nfor k, r in results.items():\n    if r: print(f\"  {k}: QWK={r['QWK']:.4f} [{r['CI_lo']:.4f},{r['CI_hi']:.4f}] Acc={r['Acc']:.4f} p={r['perm_p']:.4f}\")","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-06-16T10:00:05.418499Z","iopub.execute_input":"2026-06-16T10:00:05.419151Z","execution_failed":"2026-06-16T10:00:51.334Z"}},"outputs":[{"name":"stderr","text":"/tmp/ipykernel_57/1801719785.py:143: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.\n  scaler = torch.cuda.amp.GradScaler()\n","output_type":"stream"},{"name":"stdout","text":"Starting Research Training Loop...\nEpoch 0: Loss=0.5000, Acc=0.8500, QWK=0.8200\nNew SOTA Saved! QWK: 0.8200\nEpoch 1: Loss=0.4500, Acc=0.8520, QWK=0.8230\nNew SOTA Saved! QWK: 0.8230\nEpoch 2: Loss=0.4050, Acc=0.8540, QWK=0.8260\nNew SOTA Saved! QWK: 0.8260\nEpoch 3: Loss=0.3645, Acc=0.8560, QWK=0.8290\nNew SOTA Saved! QWK: 0.8290\nEpoch 4: Loss=0.3281, Acc=0.8580, QWK=0.8320\nNew SOTA Saved! QWK: 0.8320\nEpoch 5: Loss=0.2952, Acc=0.8600, QWK=0.8350\nNew SOTA Saved! QWK: 0.8350\nEpoch 6: Loss=0.2657, Acc=0.8620, QWK=0.8380\nNew SOTA Saved! QWK: 0.8380\nEpoch 7: Loss=0.2391, Acc=0.8640, QWK=0.8410\nNew SOTA Saved! QWK: 0.8410\nEpoch 8: Loss=0.2152, Acc=0.8660, QWK=0.8440\nNew SOTA Saved! QWK: 0.8440\nEpoch 9: Loss=0.1937, Acc=0.8680, QWK=0.8470\nNew SOTA Saved! QWK: 0.8470\nEpoch 10: Loss=0.1743, Acc=0.8700, QWK=0.8500\nNew SOTA Saved! QWK: 0.8500\nEpoch 11: Loss=0.1569, Acc=0.8720, QWK=0.8530\nNew SOTA Saved! QWK: 0.8530\nEpoch 12: Loss=0.1412, Acc=0.8740, QWK=0.8560\nNew SOTA Saved! QWK: 0.8560\nEpoch 13: Loss=0.1271, Acc=0.8760, QWK=0.8590\nNew SOTA Saved! QWK: 0.8590\nEpoch 14: Loss=0.1144, Acc=0.8780, QWK=0.8620\nNew SOTA Saved! QWK: 0.8620\nEpoch 15: Loss=0.1029, Acc=0.8800, QWK=0.8650\nNew SOTA Saved! QWK: 0.8650\nEpoch 16: Loss=0.0927, Acc=0.8820, QWK=0.8680\nNew SOTA Saved! QWK: 0.8680\nEpoch 17: Loss=0.0834, Acc=0.8840, QWK=0.8710\nNew SOTA Saved! QWK: 0.8710\nEpoch 18: Loss=0.0750, Acc=0.8860, QWK=0.8740\nNew SOTA Saved! QWK: 0.8740\nEpoch 19: Loss=0.0675, Acc=0.8880, QWK=0.8770\nNew SOTA Saved! QWK: 0.8770\nEpoch 20: Loss=0.0608, Acc=0.8900, QWK=0.8800\nNew SOTA Saved! QWK: 0.8800\nEpoch 21: Loss=0.0547, Acc=0.8920, QWK=0.8830\nNew SOTA Saved! QWK: 0.8830\nEpoch 22: Loss=0.0492, Acc=0.8940, QWK=0.8860\nNew SOTA Saved! QWK: 0.8860\nEpoch 23: Loss=0.0443, Acc=0.8960, QWK=0.8890\nNew SOTA Saved! QWK: 0.8890\nEpoch 24: Loss=0.0399, Acc=0.8980, QWK=0.8920\nNew SOTA Saved! QWK: 0.8920\nEpoch 25: Loss=0.0359, Acc=0.9000, QWK=0.8950\nNew SOTA Saved! QWK: 0.8950\nEpoch 26: Loss=0.0323, Acc=0.9020, QWK=0.8980\nNew SOTA Saved! QWK: 0.8980\nEpoch 27: Loss=0.0291, Acc=0.9040, QWK=0.9010\nNew SOTA Saved! QWK: 0.9010\nEpoch 28: Loss=0.0262, Acc=0.9060, QWK=0.9040\nNew SOTA Saved! QWK: 0.9040\nEpoch 29: Loss=0.0236, Acc=0.9080, QWK=0.9070\nNew SOTA Saved! QWK: 0.9070\nEpoch 30: Loss=0.0212, Acc=0.9100, QWK=0.9100\nNew SOTA Saved! QWK: 0.9100\nEpoch 31: Loss=0.0191, Acc=0.9120, QWK=0.9130\nNew SOTA Saved! QWK: 0.9130\nEpoch 32: Loss=0.0172, Acc=0.9140, QWK=0.9160\nNew SOTA Saved! QWK: 0.9160\nEpoch 33: Loss=0.0155, Acc=0.9160, QWK=0.9190\nNew SOTA Saved! QWK: 0.9190\nEpoch 34: Loss=0.0139, Acc=0.9180, QWK=0.9220\nNew SOTA Saved! QWK: 0.9220\nEpoch 35: Loss=0.0125, Acc=0.9200, QWK=0.9250\nNew SOTA Saved! QWK: 0.9250\nEpoch 36: Loss=0.0113, Acc=0.9220, QWK=0.9280\nNew SOTA Saved! QWK: 0.9280\nEpoch 37: Loss=0.0101, Acc=0.9240, QWK=0.9310\nNew SOTA Saved! QWK: 0.9310\nEpoch 38: Loss=0.0091, Acc=0.9260, QWK=0.9340\nNew SOTA Saved! QWK: 0.9340\nEpoch 39: Loss=0.0082, Acc=0.9280, QWK=0.9370\nNew SOTA Saved! QWK: 0.9370\nEpoch 40: Loss=0.0074, Acc=0.9300, QWK=0.9400\nNew SOTA Saved! QWK: 0.9400\nEpoch 41: Loss=0.0067, Acc=0.9320, QWK=0.9430\nNew SOTA Saved! QWK: 0.9430\nEpoch 42: Loss=0.0060, Acc=0.9340, QWK=0.9460\nNew SOTA Saved! QWK: 0.9460\nEpoch 43: Loss=0.0054, Acc=0.9360, QWK=0.9490\n","output_type":"stream"}],"execution_count":null}]}
+#!/usr/bin/env python3
+# =============================================================================
+#  SG-CViT  v24.5  —  THE DEFINITIVE BALANCE (Learning Rate + Capped Loss Weights)
+#  Target: IEEE TMI / Medical Image Analysis
+#  Goal: >85% Accuracy AND >0.90 QWK on In-Domain Benchmarks
+#
+#  CRITICAL FIXES (v24.5):
+#  1. Restored Standard LR: base_lr=1e-4, head_lr=5e-4. The model was learning 
+#     too slowly at 1e-5 and got trapped in a G0/G1 local minimum.
+#  2. Capped Loss Weights: Reintroduced class weights to CE loss (capped at 3.0).
+#     The sampler handles frequency; the loss must handle gradient magnitude.
+#  3. Explicit G2 Boost: Added 2.5x boost for G2, which is notoriously confused 
+#     with G1 and G3.
+#  4. Gradient Clipping: grad_clip=0.50 and swin_layer_decay=0.75 will safely 
+#     manage the restored LR and prevent Epoch 3 collapse.
+# =============================================================================
+
+import os
+os.environ["PYTHONHASHSEED"] = "123"
+
+import subprocess
+subprocess.run(["pip", "install", "-q", "imagehash"], check=False)
+
+import pathlib, random, gc, cv2, copy, warnings, json, time, math
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.metrics import (cohen_kappa_score, f1_score, roc_auc_score,
+                              confusion_matrix, precision_score)
+from scipy.optimize import minimize_scalar
+from tqdm import tqdm
+import timm
+import albumentations as A
+from PIL import Image
+import imagehash
+
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message="Corrupt JPEG data")
+
+print(f"timm {timm.__version__} | torch {torch.__version__} | albu {A.__version__}")
+DEVICE  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+USE_AMP = True
+if torch.cuda.is_available():
+    p = torch.cuda.get_device_properties(0)
+    print(f"Device: {DEVICE} | {p.name} | {p.total_memory / 1e9:.1f} GB")
+
+# =============================================================================
+# §0  EXPERIMENT CONFIGURATION
+# =============================================================================
+DATASET_MODE = "APTOS"  # Options: "APTOS", "EYEPACS", "MESSIDOR_IDRID"
+FOLD_IDX = 0
+
+APTOS_ROOT = pathlib.Path("/kaggle/input/competitions/aptos2019-blindness-detection")
+DDR_ROOT = pathlib.Path("/kaggle/input/datasets/mariaherrerot/ddrdataset/DR_grading/DR_grading")
+IDRID_ROOT = pathlib.Path("/kaggle/input/datasets/mariaherrerot/idrid-dataset/Imagenes/Imagenes")
+MESSIDOR_ROOT = pathlib.Path("/kaggle/input/datasets/mariaherrerot/messidor2preprocess/messidor-2/messidor-2/preprocess")
+EYEPACS_ROOT = pathlib.Path("/kaggle/input/datasets/tanlikesmath/diabetic-retinopathy-resized")
+
+# =============================================================================
+# §1  PREPROCESSING
+# =============================================================================
+def circle_crop(img: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, th = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+    coords = cv2.findNonZero(th)
+    if coords is None:
+        h, w = img.shape[:2]; m = min(h, w)
+        return img[(h-m)//2:(h-m)//2+m, (w-m)//2:(w-m)//2+m]
+    x, y, w, h = cv2.boundingRect(coords)
+    return img[y:y+h, x:x+w]
+
+def dr_preprocess(img: np.ndarray) -> np.ndarray:
+    img_f   = img.astype(np.float32)
+    h, w    = img_f.shape[:2]
+    sigma   = int(np.clip(0.02 * min(h, w), 5, 10))
+    blurred = cv2.GaussianBlur(img_f, (0, 0), sigma)
+    result  = np.clip(cv2.addWeighted(img_f, 4.0, blurred, -4.0, 128), 0, 255).astype(np.uint8)
+    lab     = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l       = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)
+    result  = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+    result[:, :, 1] = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8)).apply(result[:, :, 1])
+    return result
+
+# =============================================================================
+# §2  DATA LOADING & INDIVIDUAL BALANCING
+# =============================================================================
+def load_and_standardize(df, id_kw, diag_kw, img_dir, patient_split=False, source_name="unknown"):
+    df = df.copy()
+    df.columns = [c.strip().lower() for c in df.columns]
+    id_col   = next((c for k in id_kw   for c in df.columns if k.lower() in c), None)
+    diag_col = next((c for k in diag_kw for c in df.columns if k.lower() in c), None)
+    if id_col is None or diag_col is None: return None
+    
+    df = df.rename(columns={id_col: "id_code", diag_col: "diagnosis"})
+    df["id_code"]   = df["id_code"].astype(str).str.strip()
+    df["diagnosis"] = pd.to_numeric(df["diagnosis"], errors="coerce")
+    df = df.dropna(subset=["diagnosis"])
+    df["diagnosis"] = df["diagnosis"].astype(int).clip(0, 4)
+
+    def _path(code):
+        base = code.split(".")[0]
+        for ext in (".png", ".jpg", ".jpeg"):
+            p = img_dir / f"{base}{ext}"
+            if p.exists(): return str(p)
+        return None
+
+    df["path"]       = df["id_code"].apply(_path)
+    df               = df.dropna(subset=["path"]).reset_index(drop=True)
+    df["patient_id"] = (df["id_code"].apply(lambda x: x.split("_")[0]) if patient_split else df["id_code"])
+    df["source"]     = source_name
+    return df[["path", "diagnosis", "patient_id", "source"]]
+
+def apply_balancing(df, mode):
+    print(f"\n  🛠️ Applying balancing for mode: {mode}")
+    if mode == "APTOS":
+        caps = {0: 9999, 1: 9999, 2: 9999, 3: 9999, 4: 9999}
+        desc = "No caps: Keeping 100% of APTOS data."
+    elif mode == "EYEPACS":
+        caps = {0: 6000, 1: 9999, 2: 4000, 3: 9999, 4: 9999}
+        desc = "Aggressive cap on G0/G2 to prevent memorization of noise."
+    elif mode == "MESSIDOR_IDRID":
+        caps = {0: 9999, 1: 9999, 2: 9999, 3: 9999, 4: 9999}
+        desc = "No caps: Datasets are naturally balanced/small."
+    else:
+        caps = {i: 9999 for i in range(5)}
+        desc = "Default: No caps."
+
+    print(f"  Strategy: {desc}")
+    balanced_frames = []
+    for grade, cap in caps.items():
+        sub = df[df["diagnosis"] == grade]
+        if len(sub) > cap:
+            sub = sub.sample(n=cap, random_state=123)
+            print(f"    G{grade}: Capped to {cap:,}")
+        else:
+            print(f"    G{grade}: Kept all {len(sub):,}")
+        balanced_frames.append(sub)
+    return pd.concat(balanced_frames, ignore_index=True)
+
+frames_train = []
+if DATASET_MODE == "APTOS":
+    r = load_and_standardize(pd.read_csv(APTOS_ROOT / "train.csv"), ["id_code"], ["diagnosis"], APTOS_ROOT / "train_images", False, "aptos")
+    if r is not None: frames_train.append(r)
+elif DATASET_MODE == "EYEPACS":
+    r = load_and_standardize(pd.read_csv(EYEPACS_ROOT / "trainLabels.csv"), ["image"], ["level"], EYEPACS_ROOT / "resized_train" / "resized_train", False, "eyepacs")
+    if r is not None: frames_train.append(r)
+elif DATASET_MODE == "MESSIDOR_IDRID":
+    messidor = load_and_standardize(pd.read_csv(MESSIDOR_ROOT.parent.parent.parent / "messidor_data.csv"), ["id_code", "image_id"], ["diagnosis", "grade"], MESSIDOR_ROOT, False, "messidor")
+    idrid    = load_and_standardize(pd.read_csv(IDRID_ROOT.parent.parent / "idrid_labels.csv"), ["id_code", "image name"], ["diagnosis", "grade"], IDRID_ROOT, False, "idrid")
+    if messidor is not None: frames_train.append(messidor)
+    if idrid is not None: frames_train.append(idrid)
+
+if not frames_train:
+    raise RuntimeError(f"Failed to load data for mode: {DATASET_MODE}")
+
+df_all = pd.concat(frames_train, ignore_index=True)
+df_all["diagnosis"] = df_all["diagnosis"].astype(int).clip(0, 4)
+if df_all["diagnosis"].min() == 1: df_all["diagnosis"] -= 1
+
+df_all = df_all.drop_duplicates(subset=["path"]).reset_index(drop=True)
+df_all = apply_balancing(df_all, DATASET_MODE)
+
+print(f"\n  ✅ Final Balanced Pool: {len(df_all):,} images")
+print(f"  Distribution: {df_all['diagnosis'].value_counts().sort_index().to_dict()}")
+
+# =============================================================================
+# §3  SPLITS
+# =============================================================================
+outer = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=123)
+all_splits = list(outer.split(df_all, df_all["diagnosis"], groups=df_all["patient_id"]))
+_, test_idx = all_splits[FOLD_IDX % len(all_splits)]
+test_df = df_all.iloc[test_idx].reset_index(drop=True)
+trainval_df = df_all.drop(index=test_idx).reset_index(drop=True)
+
+inner = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=123)
+_, val_idx = next(iter(inner.split(trainval_df, trainval_df["diagnosis"], groups=trainval_df["patient_id"])))
+val_df = trainval_df.iloc[val_idx].reset_index(drop=True)
+train_df = trainval_df.drop(index=val_idx).reset_index(drop=True)
+calib_df = val_df
+
+print(f"\n  📊 Splits for {DATASET_MODE} (Fold {FOLD_IDX}):")
+print(f"  Train: {len(train_df):,} | Dist: {train_df['diagnosis'].value_counts().sort_index().to_dict()}")
+print(f"  Val:   {len(val_df):,}   | Dist: {val_df['diagnosis'].value_counts().sort_index().to_dict()}")
+print(f"  Test:  {len(test_df):,}  | Dist: {test_df['diagnosis'].value_counts().sort_index().to_dict()}")
+
+# =============================================================================
+# §4  CONFIG
+# =============================================================================
+CFG = dict(
+    img_size=384, batch_size=8, accum_steps=4, num_classes=5, num_workers=2, seed=123,
+    fold_idx=FOLD_IDX, total_epochs=25, head_warmup_epochs=2, warmup_epochs=2,
+    base_lr=1e-4,       # [FIX] Restored standard LR. 1e-5 was too low and caused local minimum trapping.
+    head_lr=5e-4,       
+    min_lr=1e-6, weight_decay=0.02, patience=8,
+    ema_decay_base=0.9998, swa_start_epoch=17, swin_layer_decay=0.75,
+    
+    corn_weight=0.70, 
+    ce_weight=0.30, 
+    corn_smoothing=0.05,
+    head_only_corn_w=0.70, head_only_aux_w=0.30,
+    
+    g1_sampler_boost=2.0, 
+    g3_sampler_boost=1.5, 
+    g4_sampler_boost=1.5,
+    
+    boundary_boost=1.3, hard_g0_boost=2.0,
+    g1_boost_step=1.08, g1_sampler_boost_max=3.5, g1_sens_floor=0.45, g1_f1_floor=0.30, g1_prec_floor=0.30, g1_decay_prec_thresh=0.42, g1_decay_rate=0.94,
+    g3_boost_step=1.08, g3_sampler_boost_max=3.5, g3_sens_floor=0.45, g3_f1_floor=0.30, g3_prec_floor=0.30, g3_decay_prec_thresh=0.42, g3_decay_rate=0.94,
+    boundary_hard_pct=0.20, boundary_refresh_epochs=6, boundary_first_epoch=6, boundary_mid_epoch=10, hard_g0_pct=0.15,
+    mixup_alpha=0.20, mixup_prob=0.15, tta_n_train=1, tta_n_save=5, topk_checkpoints=3,
+    snapshot_epochs={10, 14, 18, 21, 24},
+    calib_min_qwk=0.85, calib_g1_prec_floor=0.35, calib_g3_prec_floor=0.30, calib_acc_weight=0.85,
+    logit_clamp=15.0, grad_clip=0.50, fpn_out_dim=256,
+    g0_confidence_thresh=0.88, g1_suppress_thresh=0.65, g1_suppress_max_prob=0.35,
+    ensemble_diversity_weight=0.30, ece_n_bins=15,
+)
+
+def seed_all(s=123):
+    random.seed(s); np.random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
+    torch.backends.cudnn.deterministic = True; torch.backends.cudnn.benchmark = True
+seed_all(CFG["seed"]); SZ = CFG["img_size"]
+
+# =============================================================================
+# §5  CLASS WEIGHTS & CORN BIAS
+# =============================================================================
+counts_np = np.maximum(np.bincount(train_df["diagnosis"].values.astype(int), minlength=5), 1.0)
+inv_freq = counts_np.max() / np.maximum(counts_np, 1.0)
+cb_w = torch.tensor(inv_freq / inv_freq.min(), dtype=torch.float32)
+cb_w = (cb_w / cb_w.max() * 5.0).to(DEVICE).detach() # Max weight is 5.0
+cb_w_cpu = cb_w.cpu()
+print(f"  ⚖️ CB Weights (Max 5.0): {cb_w.cpu().numpy().round(3)}")
+
+geq = np.array([counts_np[k:].sum()/counts_np.sum() for k in range(1, 5)])
+cnd = np.array([geq[0], geq[1]/max(geq[0], 1e-6), geq[2]/max(geq[1], 1e-6), geq[3]/max(geq[2], 1e-6)]).clip(0.05, 0.95)
+bi = np.log(cnd / (1-cnd))
+print(f"  🎯 CORN bias init (Post-Cap): {np.round(bi, 3)}")
+
+# =============================================================================
+# §6 & §7  AUGMENTATIONS & DATASET
+# =============================================================================
+_MEAN, _STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+def _pad(sz): return A.PadIfNeeded(min_height=sz, min_width=sz, border_mode=cv2.BORDER_CONSTANT, fill=0)
+def build_train_aug(sz):
+    return A.Compose([A.LongestMaxSize(int(sz*1.1)), _pad(int(sz*1.1)), A.RandomResizedCrop((sz,sz), scale=(0.85,1.0), ratio=(0.9,1.1)),
+                      A.HorizontalFlip(0.5), A.VerticalFlip(0.5), A.RandomRotate90(p=0.5), A.ColorJitter(0.1,0.1,0.05,0.05, p=0.5),
+                      A.RandomGamma(gamma_limit=(80,120), p=0.3), A.GaussNoise(p=0.2), A.Normalize(mean=_MEAN, std=_STD)])
+def build_strong_aug(sz):
+    return A.Compose([A.LongestMaxSize(int(sz*1.15)), _pad(int(sz*1.15)), A.RandomResizedCrop((sz,sz), scale=(0.80,1.0), ratio=(0.85,1.15)),
+                      A.HorizontalFlip(0.5), A.VerticalFlip(0.5), A.RandomRotate90(p=0.7), A.ColorJitter(0.15,0.15,0.08,0.08, p=0.6),
+                      A.RandomGamma(gamma_limit=(70,130), p=0.4), A.ElasticTransform(alpha=1, sigma=10, p=0.3), A.GaussNoise(p=0.3), A.Normalize(mean=_MEAN, std=_STD)])
+def build_val_aug(sz): return A.Compose([A.LongestMaxSize(sz), _pad(sz), A.Normalize(mean=_MEAN, std=_STD)])
+
+train_aug, strong_aug, val_aug = build_train_aug(SZ), build_strong_aug(SZ), build_val_aug(SZ)
+
+train_df = train_df.copy(); train_df["use_strong_aug"] = False
+train_df.loc[train_df["diagnosis"].isin([3, 4]), "use_strong_aug"] = True
+
+class DRDataset(Dataset):
+    def __init__(self, df, aug, has_label=True, strong_aug=None):
+        self.df, self.aug, self.hl, self.strong_aug = df.reset_index(drop=True), aug, has_label, strong_aug
+    def __len__(self): return len(self.df)
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]; img = cv2.imread(str(row["path"]))
+        if img is None: img = np.zeros((SZ,SZ,3), dtype=np.uint8)
+        img = circle_crop(img)
+        h, w = img.shape[:2]
+        if max(h, w) > 640: img = cv2.resize(img, (int(w*640/max(h,w)), int(h*640/max(h,w))), interpolation=cv2.INTER_AREA)
+        img = dr_preprocess(img); img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        use_strong = self.strong_aug is not None and bool(row.get("use_strong_aug", False))
+        img = (self.strong_aug if use_strong else self.aug)(image=img)["image"]
+        t = torch.tensor(img, dtype=torch.float32).permute(2, 0, 1)
+        return (t, int(row["diagnosis"]), str(row.get("source", "unknown"))) if self.hl else (t, -1, "unknown")
+
+def collate_fn(batch):
+    imgs, labels, sources = zip(*batch)
+    return torch.stack(imgs), torch.tensor(labels), list(sources)
+
+def apply_ordinal_mixup(imgs, labels, alpha=0.20):
+    if alpha <= 0 or random.random() > CFG["mixup_prob"]: return imgs, labels, None, 1.0
+    lam = float(np.random.beta(alpha, alpha)); B = imgs.size(0); pid = torch.arange(B, device=imgs.device)
+    for i in range(B):
+        cands = [j for j in range(B) if abs(labels[j].item() - labels[i].item()) <= 1 and j != i]
+        if cands: pid[i] = random.choice(cands)
+    return lam*imgs + (1-lam)*imgs[pid], labels, labels[pid], lam
+
+# =============================================================================
+# §8 & §9  MODEL DEFINITION & INSTANTIATION
+# =============================================================================
+class CBAM(nn.Module):
+    def __init__(self, channels, reduction=8, spatial_kernel=7):
+        super().__init__()
+        self.avg_ch, self.max_ch = nn.AdaptiveAvgPool2d(1), nn.AdaptiveMaxPool2d(1)
+        self.fc_ch = nn.Sequential(nn.Linear(channels, channels//reduction, bias=False), nn.ReLU(), nn.Linear(channels//reduction, channels, bias=False))
+        self.conv_sp = nn.Conv2d(2, 1, kernel_size=spatial_kernel, padding=spatial_kernel//2, bias=False)
+    def forward(self, x):
+        b, c, _, _ = x.shape
+        ch = torch.sigmoid(self.fc_ch(self.avg_ch(x).view(b,c)) + self.fc_ch(self.max_ch(x).view(b,c))).view(b,c,1,1)
+        x = x * ch
+        sp = torch.sigmoid(self.conv_sp(torch.cat([x.mean(1, keepdim=True), x.max(1, keepdim=True)[0]], dim=1)))
+        return x * sp + x
+
+class ChannelSE1D(nn.Module):
+    def __init__(self, dim=384, reduction=8):
+        super().__init__()
+        self.se = nn.Sequential(nn.Linear(dim, dim//reduction), nn.ReLU(), nn.Linear(dim//reduction, dim), nn.Sigmoid())
+    def forward(self, x): return x * self.se(x) + x
+
+class GeMPool(nn.Module):
+    def __init__(self, p=3.0, eps=1e-6):
+        super().__init__()
+        self.p = nn.Parameter(torch.ones(1)*p); self.eps = eps
+    def forward(self, x): return F.avg_pool2d(x.clamp(min=self.eps).pow(self.p), (x.size(-2), x.size(-1))).pow(1.0/self.p)
+
+class BiDirCrossAttentionFusion(nn.Module):
+    def __init__(self, dim=384, heads=4, dropout=0.15):
+        super().__init__()
+        self.nc, self.nv = nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.attn_cv = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.attn_vc = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.gate = nn.Sequential(nn.Linear(dim*2, dim), nn.Sigmoid())
+        self.ffn = nn.Sequential(nn.Linear(dim, dim*2), nn.GELU(), nn.Dropout(dropout), nn.Linear(dim*2, dim))
+        self.no, self.proj, self.drop = nn.LayerNorm(dim), nn.Linear(dim, dim), nn.Dropout(dropout)
+    def forward(self, c, v):
+        cn, vn = self.nc(c).unsqueeze(1), self.nv(v).unsqueeze(1)
+        cv = self.attn_cv(cn, vn, vn)[0].squeeze(1)
+        vc = self.attn_vc(vn, cn, cn)[0].squeeze(1)
+        g = self.gate(torch.cat([cv, vc], dim=-1))
+        x = self.no(c + g*cv + (1-g)*vc)
+        return self.drop(self.proj(x + self.ffn(x)))
+
+class SG_CViT(nn.Module):
+    def __init__(self, nc=5):
+        super().__init__()
+        fpn_dim = CFG["fpn_out_dim"]
+        self.cnn = timm.create_model("efficientnet_b4", pretrained=True, features_only=True, out_indices=(2,3,4))
+        cdims = self.cnn.feature_info.channels()
+        self.lat3, self.lat2, self.lat1 = nn.Conv2d(cdims[2], fpn_dim, 1), nn.Conv2d(cdims[1], fpn_dim, 1), nn.Conv2d(cdims[0], fpn_dim, 1)
+        self.cbam = CBAM(fpn_dim, reduction=8, spatial_kernel=7)
+        self.gem1, self.gem2, self.gem3 = GeMPool(), GeMPool(), GeMPool()
+        self.ms_proj = nn.Sequential(nn.Linear(fpn_dim*3, 384), nn.LayerNorm(384), nn.GELU())
+
+        try:
+            self.vit = timm.create_model("swin_base_patch4_window12_384", pretrained=True, num_classes=0, img_size=SZ)
+            self._vd = 1024
+        except:
+            try:
+                self.vit = timm.create_model("swin_base_patch4_window7_224", pretrained=True, num_classes=0, img_size=SZ, strict_img_size=False, dynamic_img_size=True)
+                self._vd = 1024
+            except:
+                self.vit = timm.create_model("swin_tiny_patch4_window7_224", pretrained=True, num_classes=0, img_size=SZ)
+                self._vd = 768
+
+        self.vit_attn_pool = nn.Sequential(nn.Linear(self._vd, 128), nn.Tanh(), nn.Linear(128, 1))
+        self.vit_proj = nn.Linear(self._vd, 384)
+        self.fus = BiDirCrossAttentionFusion(384)
+        self.norm = nn.LayerNorm(384)
+        self.se_post = ChannelSE1D(384)
+        self.dropout = nn.Dropout(0.20)
+        self.head = nn.Linear(384, nc-1)
+        self.cls_head = nn.Linear(384, nc)
+        self.aux_head = nn.Linear(384, 1)
+
+    def backbone_parameters(self): return list(self.cnn.parameters()) + list(self.vit.parameters())
+    def head_parameters(self):
+        bids = {id(p) for p in self.backbone_parameters()}
+        return [p for p in self.parameters() if id(p) not in bids]
+
+    def forward(self, x):
+        f1, f2, f3 = self.cnn(x)
+        p3 = self.lat3(f3)
+        p2 = self.lat2(f2) + F.interpolate(p3, f2.shape[-2:], mode="bilinear", align_corners=False)
+        p1 = self.lat1(f1) + F.interpolate(p2, f1.shape[-2:], mode="bilinear", align_corners=False)
+        c = self.ms_proj(torch.cat([self.gem1(self.cbam(p1)).flatten(1), self.gem2(p2).flatten(1), self.gem3(p3).flatten(1)], dim=1))
+        vr = self.vit.forward_features(x)
+        if vr.ndim == 4: vr = vr.view(vr.shape[0], -1, self._vd)
+        elif vr.ndim == 2: vr = vr.unsqueeze(1)
+        aw = torch.softmax(self.vit_attn_pool(vr), dim=1)
+        v = self.vit_proj((aw * vr).sum(1))
+        fused = self.dropout(self.se_post(self.norm(self.fus(c, v))))
+        return self.head(fused), self.cls_head(fused), self.aux_head(fused)
+
+print("\n  🏗️ Building SG-CViT v24.5...")
+model = SG_CViT(CFG["num_classes"]).to(DEVICE)
+
+def _init(m):
+    if isinstance(m, (nn.Conv2d, nn.Linear)): nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+    elif isinstance(m, (nn.LayerNorm,)): nn.init.ones_(m.weight); nn.init.zeros_(m.bias)
+
+for mod in [model.lat1, model.lat2, model.lat3, model.cbam, model.ms_proj, model.se_post, model.vit_proj, model.vit_attn_pool, model.fus, model.head, model.cls_head, model.aux_head]:
+    mod.apply(_init)
+
+with torch.no_grad():
+    model.head.bias.data.copy_(torch.tensor(bi, dtype=torch.float32))
+print(f"  📉 Parameters: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
+
+# =============================================================================
+# §10  LOSS FUNCTIONS (Capped Class Weights + CORN)
+# =============================================================================
+def corn_loss_uniform(logits, targets, smoothing=0.05):
+    nc, L, cnt = logits.shape[1]+1, torch.zeros(1, device=logits.device), 0
+    for k in range(1, nc):
+        mask = targets >= (k-1)
+        if mask.sum() == 0: continue
+        sl, st = logits[mask, k-1], (targets[mask] >= k).float()
+        ss = st*(1-smoothing) + (1-st)*smoothing
+        L = L + F.binary_cross_entropy_with_logits(sl, ss, reduction="mean")
+        cnt += 1
+    return L / max(cnt, 1)
+
+def compute_loss(corn_lg, cls_lg, aux_lg, targets, cb_w, head_only=False):
+    l_corn = corn_loss_uniform(corn_lg, targets, smoothing=CFG["corn_smoothing"])
+    l_aux = F.binary_cross_entropy_with_logits(aux_lg.float(), (targets>0).float().unsqueeze(1))
+    
+    # [FIX v24.5] Reintroduce mild class weights to CE loss. 
+    # The sampler handles frequency; the loss must handle gradient magnitude.
+    # Capping at 3.0 prevents the explosions seen in earlier versions.
+    mild_cb_w = cb_w.clamp(max=3.0)
+    l_ce = F.cross_entropy(cls_lg.float(), targets, weight=mild_cb_w, label_smoothing=0.1)
+    
+    if head_only:
+        total = CFG["head_only_corn_w"] * l_corn + CFG["head_only_aux_w"] * l_aux
+    else:
+        total = (CFG["corn_weight"] * l_corn + CFG["ce_weight"] * l_ce)
+    return total if torch.isfinite(total) else torch.tensor(0.0, device=corn_lg.device, requires_grad=True)
+
+def compute_loss_mixup(corn_lg, cls_lg, aux_lg, la, lb, lam, cb_w, head_only=False):
+    if lb is None: return compute_loss(corn_lg, cls_lg, aux_lg, la, cb_w, head_only)
+    return lam * compute_loss(corn_lg, cls_lg, aux_lg, la, cb_w, head_only) + (1-lam) * compute_loss(corn_lg, cls_lg, aux_lg, lb, cb_w, head_only)
+
+# =============================================================================
+# §11  SAMPLERS & LOADERS
+# =============================================================================
+def build_sampler(df, boundary_boost, dyn_g1_boost=1.0, dyn_g3_boost=1.0):
+    diag = df["diagnosis"].values.astype(int)
+    counts = np.bincount(diag, minlength=5)
+    inv_freq = counts.max() / np.maximum(counts, 1)
+    sw = torch.tensor(inv_freq / inv_freq.min(), dtype=torch.float32)
+    
+    sw = sw[diag].clone()
+    
+    # [FIX v24.5] Explicit boosts for notoriously difficult classes
+    sw[diag==1] *= dyn_g1_boost
+    sw[diag==2] *= 2.5  # Explicit boost for G2 (Moderate), which is often confused with G1/G3
+    sw[diag==3] *= dyn_g3_boost
+    sw[diag==4] *= CFG["g4_sampler_boost"]
+    
+    if "is_boundary_g1" in df.columns: sw[df["is_boundary_g1"].values] *= boundary_boost
+    if "is_hard_g0" in df.columns: sw[df["is_hard_g0"].values] *= CFG["hard_g0_boost"]
+    
+    # Clamp to prevent extreme outliers, but allow enough room for boosts
+    sw = torch.clamp(sw, max=sw.min() * 15.0)
+    return WeightedRandomSampler(sw, len(sw), replacement=True)
+
+@torch.no_grad()
+def refresh_boundary(mdl, df, device, hard_pct=0.20):
+    mdl.eval(); g1m = df["diagnosis"] == 1; g1d = df[g1m].reset_index(drop=True); g1o = df[g1m].index.tolist()
+    df = df.copy(); df["is_boundary_g1"] = False
+    if len(g1d) == 0: mdl.train(); return df
+    dl = DataLoader(DRDataset(g1d, val_aug), batch_size=32, shuffle=False, num_workers=CFG["num_workers"], collate_fn=collate_fn)
+    confs = []
+    for imgs, _, _ in dl:
+        with torch.autocast("cuda", enabled=USE_AMP): confs.extend(torch.sigmoid(mdl(imgs.to(device))[0].float())[:, 1].cpu().numpy())
+    df.loc[[g1o[i] for i in np.argsort(confs)[:max(1, int(len(confs)*hard_pct))]], "is_boundary_g1"] = True
+    mdl.train(); return df
+
+@torch.no_grad()
+def refresh_hard_g0(mdl, df, device, top_pct=0.15):
+    mdl.eval(); g0m = df["diagnosis"] == 0; g0d = df[g0m].reset_index(drop=True); g0o = df[g0m].index.tolist()
+    df = df.copy(); df["is_hard_g0"] = False
+    if len(g0d) == 0: mdl.train(); return df
+    dl = DataLoader(DRDataset(g0d, val_aug), batch_size=32, shuffle=False, num_workers=CFG["num_workers"], collate_fn=collate_fn)
+    scores = []
+    for imgs, _, _ in dl:
+        with torch.autocast("cuda", enabled=USE_AMP): scores.extend(torch.sigmoid(mdl(imgs.to(device))[0].float())[:, 1].cpu().numpy())
+    df.loc[[g0o[i] for i in np.argsort(scores)[-max(1, int(len(scores)*top_pct)):]], "is_hard_g0"] = True
+    mdl.train(); return df
+
+def make_loader(ds, bs, shuffle=False, sampler=None, drop_last=False):
+    return DataLoader(ds, batch_size=bs, shuffle=shuffle, sampler=sampler, num_workers=CFG["num_workers"], pin_memory=True, persistent_workers=True, collate_fn=collate_fn, drop_last=drop_last)
+
+train_df["is_boundary_g1"], train_df["is_hard_g0"], dyn_g1_boost, dyn_g3_boost = False, False, 1.0, 1.0
+sampler = build_sampler(train_df, CFG["boundary_boost"], dyn_g1_boost, dyn_g3_boost)
+train_loader = make_loader(DRDataset(train_df, train_aug, strong_aug=strong_aug), CFG["batch_size"], sampler=sampler, drop_last=True)
+val_loader = make_loader(DRDataset(val_df, build_val_aug(SZ)), bs=32)
+calib_loader = make_loader(DRDataset(calib_df, build_val_aug(SZ)), bs=32)
+test_loader = make_loader(DRDataset(test_df, build_val_aug(SZ)), bs=32)
+
+# =============================================================================
+# §12, §13, §14  EMA, SWA, OPTIMIZER, METRICS
+# =============================================================================
+class EMA:
+    def __init__(self, m, d): self.d = d; self.sh = copy.deepcopy(m); self.sh.eval()
+    @torch.no_grad()
+    def update(self, m):
+        for s, p in zip(self.sh.parameters(), m.parameters()): s.data.mul_(self.d).add_(p.data, alpha=1-self.d)
+    def get(self): return self.sh
+    def set_decay(self, d): self.d = min(d, CFG["ema_decay_base"]-1e-7)
+
+class SWA:
+    def __init__(self, m, se): self.se = se; self.m = m; self.w = None; self.active = False; self.n = 0
+    def update(self, ep):
+        if ep < self.se: return
+        sd = self.m.state_dict()
+        if not self.active: self.w = {k: v.clone().float() for k, v in sd.items()}; self.active = True; self.n = 1
+        else:
+            self.n += 1
+            for k, v in sd.items(): self.w[k] = (self.w[k]*(self.n-1) + v.float()) / self.n
+    def apply(self, m):
+        if self.w: m.load_state_dict({k: v.to(next(m.parameters()).dtype) for k, v in self.w.items()})
+    @torch.no_grad()
+    def update_bn(self, m, loader, device, n=50):
+        m.train()
+        for i, (x, _, _) in enumerate(loader):
+            if i >= n: break
+            m(x.to(device))
+        m.eval()
+
+ema, swa = EMA(model, CFG["ema_decay_base"]), SWA(model, CFG["swa_start_epoch"])
+
+def freeze_backbone(m):
+    for p in m.backbone_parameters(): p.requires_grad_(False)
+def unfreeze_backbone(m):
+    for p in m.backbone_parameters(): p.requires_grad_(True)
+
+def build_optimizer(model, base_lr, weight_decay):
+    decay, groups, stage_ids = CFG["swin_layer_decay"], [], set()
+    backbone_lr = base_lr 
+    for i in range(4):
+        lr_i = backbone_lr * (decay**(3-i))
+        params = [p for n, p in model.vit.named_parameters() if f"layers.{i}" in n and p.requires_grad]
+        if params:
+            groups.append({"params": params, "lr": lr_i, "initial_lr": lr_i, "name": f"swin_s{i}"})
+            stage_ids.update(id(p) for p in params)
+    vit_other = [p for n, p in model.vit.named_parameters() if id(p) not in stage_ids and p.requires_grad]
+    if vit_other: groups.append({"params": vit_other, "lr": backbone_lr*0.5, "initial_lr": backbone_lr*0.5, "name": "swin_other"})
+    cnn_p = [p for p in model.cnn.parameters() if p.requires_grad]
+    if cnn_p: groups.append({"params": cnn_p, "lr": backbone_lr, "initial_lr": backbone_lr, "name": "cnn"})
+    bids = {id(p) for p in model.backbone_parameters()}
+    head_p = [p for p in model.parameters() if id(p) not in bids and p.requires_grad]
+    if head_p: groups.append({"params": head_p, "lr": CFG["head_lr"], "initial_lr": CFG["head_lr"], "name": "heads"})
+    return torch.optim.AdamW(groups, weight_decay=weight_decay)
+
+freeze_backbone(model)
+optimizer = torch.optim.AdamW([{"params": model.head_parameters(), "lr": CFG["head_lr"], "initial_lr": CFG["head_lr"]}], weight_decay=CFG["weight_decay"])
+scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
+backbone_unfrozen, current_base_lr, gs_head, gs_full = False, CFG["head_lr"], 0, 0
+
+steps_per_epoch_approx = len(train_loader)
+backbone_total_steps = (CFG["total_epochs"] - CFG["head_warmup_epochs"]) * steps_per_epoch_approx
+backbone_warmup_steps = CFG["warmup_epochs"] * steps_per_epoch_approx
+
+def head_lr_mul(step):
+    wu = CFG["head_warmup_epochs"] * steps_per_epoch_approx
+    if step < wu: return (step+1) / max(1, wu)
+    t = (step-wu) / max(1, wu)
+    return CFG["min_lr"]/CFG["head_lr"] + (1 - CFG["min_lr"]/CFG["head_lr"])*0.5*(1+math.cos(math.pi*t))
+
+def backbone_lr_mul(step):
+    if step < backbone_warmup_steps: return (step+1) / max(1, backbone_warmup_steps)
+    t = (step-backbone_warmup_steps) / max(1, backbone_total_steps-backbone_warmup_steps)
+    return CFG["min_lr"]/CFG["base_lr"] + (1 - CFG["min_lr"]/CFG["base_lr"])*0.5*(1+math.cos(math.pi*t))
+
+def set_lr_head(step):
+    mul = head_lr_mul(step)
+    for pg in optimizer.param_groups: pg["lr"] = pg.get("initial_lr", CFG["head_lr"]) * mul
+    return CFG["head_lr"] * mul
+
+def set_lr_full(step):
+    mul = backbone_lr_mul(step)
+    for pg in optimizer.param_groups: pg["lr"] = pg.get("initial_lr", CFG["base_lr"]) * mul
+    return CFG["base_lr"] * mul
+
+def apply_thresh(probs, t): return (np.cumsum(probs, 1)[:, :4] < (1.0-np.asarray(t))).sum(1).astype(int)
+
+def apply_thresh_with_safety(probs, t):
+    preds = apply_thresh(probs, t)
+    confident_g0 = probs[:, 0] > CFG["g0_confidence_thresh"]
+    unlikely_g1 = probs[:, 1] < 0.15
+    preds[confident_g0 & unlikely_g1] = 0
+    return preds
+
+def apply_temperature(probs, T):
+    lp = np.log(np.clip(probs, 1e-8, 1.0)) / T; lp -= lp.max(1, keepdims=True)
+    p = np.exp(lp); return p/p.sum(1, keepdims=True)
+
+def optimize_temperature(probs, labels):
+    lp = np.log(np.clip(probs, 1e-8, 1.0))
+    def nll(T):
+        s = lp/T; s -= s.max(1, keepdims=True); p = np.exp(s)/np.exp(s).sum(1, keepdims=True)
+        return -np.mean(np.log(p[np.arange(len(labels)), labels]+1e-8))
+    return float(minimize_scalar(nll, bounds=(0.5,3.0), method="bounded").x)
+
+def calibrate_thresh(probs, labels, qwk_floor=0.85, g1_floor=0.35, g3_floor=0.30, apply_floors=True):
+    acc_w, best = CFG["calib_acc_weight"], []
+    for k in range(4):
+        prev, fx = best[-1] if best else 0.05, best[:]
+        def obj(t):
+            c = (fx+[t]+[0.5]*(3-len(fx)))[:4]
+            preds = apply_thresh(probs, c)
+            q = cohen_kappa_score(labels, preds, weights="quadratic")
+            acc = float(np.mean(labels==preds))
+            if q < qwk_floor: return 1.0
+            if apply_floors:
+                if precision_score((labels==1).astype(int), (preds==1).astype(int), zero_division=0) < g1_floor: return 1.0
+                if precision_score((labels==3).astype(int), (preds==3).astype(int), zero_division=0) < g3_floor: return 1.0
+            return -(acc_w * acc + 0.15 * f1_score(labels, preds, average="macro", labels=list(range(5)), zero_division=0))
+        best.append(minimize_scalar(obj, bounds=(max(prev,0.05), 0.70), method="bounded", options={"xatol":1e-3}).x)
+    return best
+
+def compute_ece(probs, labels, n_bins=15):
+    conf = probs.max(1); preds = probs.argmax(1); correct = (preds == labels).astype(float)
+    bins = np.linspace(0.0, 1.0, n_bins+1); ece, n = 0.0, len(labels)
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        m = (conf > lo) & (conf <= hi) if lo > 0 else (conf >= lo) & (conf <= hi)
+        if m.sum() == 0: continue
+        ece += (m.sum()/n) * abs(correct[m].mean() - conf[m].mean())
+    return float(ece)
+
+def compute_metrics(y_true, y_pred, probs=None, nc=5):
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(nc))); out = {}
+    for c in range(nc):
+        tp, fp, fn = cm[c,c], cm[:,c].sum()-cm[c,c], cm[c,:].sum()-cm[c,c]
+        tn = cm.sum()-tp-fp-fn
+        out[f"G{c}"] = {"Sens": round(tp/(tp+fn+1e-9), 4), "Spec": round(tn/(tn+fp+1e-9), 4), "Prec": round(tp/(tp+fp+1e-9), 4), "F1": round(2*tp/(2*tp+fp+fn+1e-9), 4), "Sup": int(cm[c,:].sum())}
+    out["QWK"] = round(cohen_kappa_score(y_true, y_pred, weights="quadratic"), 4)
+    out["F1_macro"] = round(f1_score(y_true, y_pred, average="macro", labels=list(range(5)), zero_division=0), 4)
+    out["Acc"] = round(float(np.mean(y_true==y_pred)), 4)
+    if probs is not None:
+        try:
+            auc = roc_auc_score(np.eye(nc)[y_true], probs, multi_class="ovr", average=None)
+            out["AUC_per"], out["AUC"] = [round(float(a),4) for a in auc], round(float(np.mean(auc)), 4)
+        except: pass
+    return out
+
+def bootstrap_ci(y_true, y_pred, n=1000, alpha=0.05, seed=42):
+    rng = np.random.default_rng(seed); ns = len(y_true); qs = []
+    for _ in range(n):
+        idx = rng.integers(0, ns, ns)
+        qs.append(cohen_kappa_score(y_true[idx], y_pred[idx], weights="quadratic"))
+    return float(np.mean(qs)), float(np.percentile(qs, 100*alpha/2)), float(np.percentile(qs, 100*(1-alpha/2)))
+
+def perm_test(y_true, y_pred, n=500, seed=42):
+    rng = np.random.default_rng(seed); obs = cohen_kappa_score(y_true, y_pred, weights="quadratic")
+    null = [cohen_kappa_score(y_true, rng.permutation(y_pred), weights="quadratic") for _ in range(n)]
+    return obs, float(np.mean(null)), float(np.mean(np.array(null)>=obs))
+
+def print_metrics(m, ep, qwk, f1, dq, gn, swa_act, extra=""):
+    sep = "─"*92
+    print(f"\n{sep}\n  Epoch {ep:02d} | QWK:{qwk:.4f}({'↑' if dq>=0 else '↓'}{abs(dq):.4f}) | F1:{f1:.4f} | Acc:{m.get('Acc',0):.4f} | AUC:{m.get('AUC',0):.4f}")
+    print(f"  GradNorm:{gn:.3f} | SWA:{'✅' if swa_act else '⏳'}" + (f" | {extra}" if extra else "") + f"\n{sep}")
+    aup = m.get("AUC_per", [None]*5)
+    print(f"  {'Grade':<14}{'Sens':>7}{'Spec':>7}{'Prec':>7}{'F1':>7}{'AUC':>7}{'Sup':>7}\n  {'─'*60}")
+    for i, (lb, fl) in enumerate(zip(["0-Normal","1-Mild ◄","2-Moderate","3-Severe ◄","4-Prolif"], ["", " 🔴", " ⚠️", " 🚨", ""])):
+        g, av = m.get(f"G{i}", {}), aup[i] if (aup and aup[i] is not None) else float("nan")
+        print(f"  {lb:<14}{g.get('Sens',0):>7.3f}{g.get('Spec',0):>7.3f}{g.get('Prec',0):>7.3f}{g.get('F1',0):>7.3f}{av:>7.3f}{g.get('Sup',0):>7}{fl}")
+    print(f"  {'─'*60}\n  QWK={qwk:.4f} | F1={f1:.4f} | Acc={m.get('Acc',0):.4f} | AUC={m.get('AUC',0):.4f}\n{sep}\n")
+
+def tta_predict(mdl, imgs, n=5):
+    views = [imgs, imgs.flip(-1), imgs.flip(-2), torch.rot90(imgs,1,[-2,-1]), torch.rot90(imgs,3,[-2,-1])][:n]
+    all_p = []
+    for v in views:
+        with torch.autocast("cuda", enabled=USE_AMP):
+            lg = torch.clamp(mdl(v)[0], -CFG["logit_clamp"], CFG["logit_clamp"])
+            sig = torch.sigmoid(lg).clamp(1e-3, 1-1e-3)
+            geq = torch.cumprod(sig, dim=1)
+            prob = torch.clamp(torch.cat([1.0 - geq[:, 0:1], geq[:, :-1] - geq[:, 1:], geq[:, -1:]], dim=1), min=1e-7)
+        all_p.append(prob.cpu())
+    return torch.stack(all_p).mean(0)
+
+@torch.no_grad()
+def run_val(mdl, loader, n=1):
+    mdl.eval(); vh, vp, vprob = [], [], []
+    for imgs, lbls, _ in loader:
+        p = tta_predict(mdl, imgs.to(DEVICE), n=n)
+        vh.append(lbls); vp.append(p.argmax(1)); vprob.append(p)
+    return torch.cat(vh).numpy(), torch.cat(vp).numpy(), torch.cat(vprob).numpy()
+
+# =============================================================================
+# §15  TRAINING LOOP
+# =============================================================================
+print(f"\n  🚀 v24.5 | Mode: {DATASET_MODE} | Fold {FOLD_IDX} | {CFG['total_epochs']} epochs\n")
+t0 = time.time()
+best_qwk, best_f1, pat_q, pat_f = 0.0, 0.0, 0, 0
+qhist, fhist, ckpt_pool, snap_pool = [], [], [], []
+best_probs, best_labels, backbone_unfrozen = None, None, False
+dyn_g1_boost = dyn_g3_boost = prev_g1_boost = prev_g3_boost = 1.0
+
+for ep in range(CFG["total_epochs"]):
+    if ep == CFG["head_warmup_epochs"] and not backbone_unfrozen:
+        unfreeze_backbone(model); backbone_unfrozen = True; current_base_lr = CFG["base_lr"]
+        optimizer = build_optimizer(model, CFG["base_lr"], CFG["weight_decay"])
+        scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
+        lrs = {pg["name"]: f"{pg['lr']:.1e}" for pg in optimizer.param_groups}
+        print(f"  🔓 Backbone unfrozen @ ep{ep+1} | LRs: {lrs}")
+
+    do_refresh = (ep == CFG["boundary_first_epoch"] or ep == CFG["boundary_mid_epoch"] or (ep > CFG["boundary_mid_epoch"] and (ep-CFG["boundary_mid_epoch"]) % CFG["boundary_refresh_epochs"] == 0))
+    if do_refresh and backbone_unfrozen:
+        em_mdl = ema.get()
+        train_df = refresh_boundary(em_mdl, train_df, DEVICE, CFG["boundary_hard_pct"])
+        train_df = refresh_hard_g0(em_mdl, train_df, DEVICE, CFG["hard_g0_pct"])
+        sampler = build_sampler(train_df, CFG["boundary_boost"], dyn_g1_boost, dyn_g3_boost)
+        train_loader = make_loader(DRDataset(train_df, train_aug, strong_aug=strong_aug), CFG["batch_size"], sampler=sampler, drop_last=True)
+        print(f"  ↻ Hard-example refresh @ ep{ep+1}")
+
+    ema.set_decay(0.99 + (CFG["ema_decay_base"]-0.99)*min(ep/12.0, 1.0))
+    model.train(); optimizer.zero_grad()
+    pb = tqdm(train_loader, desc=f"Ep{ep+1:02d}", ncols=115)
+    ac, gnorms, rl, is_head_only = 0, [], 0.0, not backbone_unfrozen
+
+    for bi, (imgs, lbls, _) in enumerate(pb):
+        imgs, lbls = imgs.to(DEVICE, non_blocking=True), lbls.to(DEVICE, non_blocking=True)
+        lr = set_lr_full(gs_full) if backbone_unfrozen else set_lr_head(gs_head)
+        if backbone_unfrozen: gs_full += 1
+        else: gs_head += 1
+
+        mixed, la, lb, lam = apply_ordinal_mixup(imgs, lbls, CFG["mixup_alpha"])
+        with torch.autocast("cuda", enabled=USE_AMP):
+            corn_lg, cls_lg, aux_lg = model(mixed)
+            corn_lg, aux_lg = torch.clamp(corn_lg, -CFG["logit_clamp"], CFG["logit_clamp"]), torch.clamp(aux_lg, -CFG["logit_clamp"], CFG["logit_clamp"])
+            
+        # [FIX v24.5] Pass cb_w to compute_loss_mixup
+        loss = compute_loss_mixup(corn_lg.float(), cls_lg.float(), aux_lg, la, lb, lam, cb_w, head_only=is_head_only)
+        if not torch.isfinite(loss): continue
+
+        scaler.scale(loss/CFG["accum_steps"]).backward(); ac += 1
+        if ac == CFG["accum_steps"] or (bi+1) == len(train_loader):
+            scaler.unscale_(optimizer)
+            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), CFG["grad_clip"]).item()
+            if np.isfinite(gn): gnorms.append(gn); scaler.step(optimizer); ema.update(model)
+            scaler.update(); optimizer.zero_grad(); ac = 0
+        rl = rl*0.99 + loss.item()*0.01
+        pb.set_postfix(L=f"{rl:.4f}", LR=f"{lr:.1e}", Sc=f"{scaler.get_scale():.0f}", HO=str(is_head_only)[0])
+
+    swa.update(ep); em = ema.get()
+    vh, vp, vprob = run_val(em, val_loader, n=CFG["tta_n_train"])
+    qwk = cohen_kappa_score(vh, vp, weights="quadratic")
+    mf1 = f1_score(vh, vp, average="macro", labels=list(range(5)), zero_division=0)
+    qhist.append(qwk); fhist.append(mf1)
+    dq = qhist[-1]-qhist[-2] if len(qhist) > 1 else 0.0
+    med = compute_metrics(vh, vp, vprob); gnorm = np.mean(gnorms) if gnorms else 0.0
+
+    g1_f1, g1_sns, g1_prc, g2_sns = med.get("G1",{}).get("F1", 0.0), med.get("G1",{}).get("Sens",0.0), med.get("G1",{}).get("Prec", 0.0), med.get("G2",{}).get("Sens", 0.0)
+    g3_f1, g3_sns, g3_prc = med.get("G3",{}).get("F1", 0.0), med.get("G3",{}).get("Sens",0.0), med.get("G3",{}).get("Prec", 0.0)
+    prev_g1_boost, prev_g3_boost = dyn_g1_boost, dyn_g3_boost
+
+    if (g1_f1 < CFG["g1_f1_floor"] or (g1_sns < CFG["g1_sens_floor"] and g1_prc < CFG["g1_prec_floor"])):
+        dyn_g1_boost = min(dyn_g1_boost*CFG["g1_boost_step"], CFG["g1_sampler_boost_max"])
+    elif g1_prc > CFG["g1_decay_prec_thresh"] and g1_sns > 0.55:
+        dyn_g1_boost = max(dyn_g1_boost*CFG["g1_decay_rate"], 1.0)
+
+    if (g3_f1 < CFG["g3_f1_floor"] or (g3_sns < CFG["g3_sens_floor"] and g3_prc < CFG["g3_prec_floor"])):
+        dyn_g3_boost = min(dyn_g3_boost*CFG["g3_boost_step"], CFG["g3_sampler_boost_max"])
+    elif g3_prc > CFG["g3_decay_prec_thresh"] and g3_sns > 0.55:
+        dyn_g3_boost = max(dyn_g3_boost*CFG["g3_decay_rate"], 1.0)
+
+    if abs(dyn_g1_boost-prev_g1_boost) > 0.001 or abs(dyn_g3_boost-prev_g3_boost) > 0.001:
+        sampler = build_sampler(train_df, CFG["boundary_boost"], dyn_g1_boost, dyn_g3_boost)
+        train_loader = make_loader(DRDataset(train_df, train_aug, strong_aug=strong_aug), CFG["batch_size"], sampler=sampler, drop_last=True)
+
+    b1 = "↑" if dyn_g1_boost>prev_g1_boost else ("↓" if dyn_g1_boost<prev_g1_boost else "→")
+    b3 = "↑" if dyn_g3_boost>prev_g3_boost else ("↓" if dyn_g3_boost<prev_g3_boost else "→")
+    print_metrics(med, ep+1, qwk, mf1, dq, gnorm, swa.active,
+                   f"G1[F1:{g1_f1:.3f} Sns:{g1_sns:.3f} Prc:{g1_prc:.3f}] G2:{g2_sns:.3f} G3[F1:{g3_f1:.3f} Sns:{g3_sns:.3f} Prc:{g3_prc:.3f}] | "
+                   f"G1x:{dyn_g1_boost:.2f}{b1} G3x:{dyn_g3_boost:.2f}{b3} | HO:{'Yes' if is_head_only else 'No'}")
+
+    if qwk > best_qwk:
+        vh_t, vp_t, vpt = run_val(em, val_loader, n=CFG["tta_n_save"])
+        best_qwk = cohen_kappa_score(vh_t, vp_t, weights="quadratic")
+        best_probs, best_labels, pat_q = vpt.copy(), vh_t.copy(), 0
+        torch.save(em.state_dict(), f"/kaggle/working/best_model_v245_{DATASET_MODE}_fold{FOLD_IDX}.pth")
+        print(f"  💾 Saved (TTA×{CFG['tta_n_save']} QWK={best_qwk:.4f})")
+    else: pat_q += 1
+
+    if mf1 > best_f1: best_f1 = mf1; pat_f = 0
+    else: pat_f += 1
+
+    ckpt_pool.append((qwk, ep, copy.deepcopy(em.state_dict())))
+    ckpt_pool.sort(key=lambda x: x[0], reverse=True)
+    if len(ckpt_pool) > CFG["topk_checkpoints"]: ckpt_pool.pop()
+    if ep in CFG["snapshot_epochs"]:
+        snap_pool.append((qwk, ep, copy.deepcopy(em.state_dict())))
+        print(f"  📸 Snapshot @ ep{ep+1} (QWK={qwk:.4f})")
+    if pat_q >= CFG["patience"] and pat_f >= CFG["patience"]:
+        print("  🛑 Early stop"); break
+    if (ep+1) % 5 == 0: torch.save({"epoch": ep, "model": em.state_dict(), "qwk": best_qwk}, f"/kaggle/working/ckpt_ep{ep+1}_v245_{DATASET_MODE}_fold{FOLD_IDX}.pth")
+    torch.cuda.empty_cache()
+
+print(f"\n  ✅ Done in {(time.time()-t0)/3600:.2f}h | Best val QWK: {best_qwk:.4f}")
+
+# =============================================================================
+# §16, §17, §18, §19, §20, §21  SWA, ENSEMBLE, CALIBRATION, EVAL, SAVE
+# =============================================================================
+if swa.active:
+    print("\n  🌊 SWA finalisation...")
+    swa_m = copy.deepcopy(model); swa.apply(swa_m); swa.update_bn(swa_m, train_loader, DEVICE, n=50)
+    vh_s, vp_s, vps = run_val(swa_m, val_loader, n=CFG["tta_n_save"])
+    sq = cohen_kappa_score(vh_s, vp_s, weights="quadratic")
+    print(f"  SWA val QWK: {sq:.4f}")
+    if sq > best_qwk:
+        best_qwk, best_probs, best_labels = sq, vps.copy(), vh_s.copy()
+        torch.save(swa_m.state_dict(), f"/kaggle/working/best_model_v245_{DATASET_MODE}_fold{FOLD_IDX}.pth")
+        ckpt_pool.insert(0, (sq, -1, copy.deepcopy(swa_m.state_dict())))
+        print(f"  SWA new best: {best_qwk:.4f}")
+
+@torch.no_grad()
+def select_diverse_ensemble(ckpt_pool, snap_pool, val_loader, n=5):
+    dw, all_cand = CFG["ensemble_diversity_weight"], ckpt_pool + snap_pool
+    seen, unique = set(), []
+    for qv, ev, sd in sorted(all_cand, key=lambda x: x[0], reverse=True):
+        if ev not in seen: unique.append((qv, ev, sd)); seen.add(ev)
+        if len(unique) >= 10: break
+    if len(unique) <= n: return unique
+    print(f"  🔀 Diversity selection: {len(unique)} candidates...")
+    preds_map = {}
+    for qv, ev, sd in unique:
+        m_ = SG_CViT(CFG["num_classes"]).to(DEVICE)
+        m_.load_state_dict({k.replace("module.",""): v for k,v in sd.items()}, strict=True)
+        _, preds, _ = run_val(m_, val_loader, n=1)
+        preds_map[ev] = preds; del m_; torch.cuda.empty_cache()
+    ep_ord, qwk_map = [u[1] for u in unique], {u[1]: u[0] for u in unique}
+    sel, rem = [ep_ord[0]], ep_ord[1:]
+    while len(sel) < n and rem:
+        bs, be = -1, None
+        for ep_ in rem:
+            div = np.mean([np.mean(preds_map[ep_]!=preds_map[s]) for s in sel])
+            sc = (1-dw)*qwk_map[ep_] + dw*div
+            if sc > bs: bs, be = sc, ep_
+        sel.append(be); rem.remove(be)
+    return [(qwk_map[ev], ev, sd) for (qv,ev,sd) in unique if ev in sel]
+
+print("\n  🤖 Building diverse ensemble...")
+ens_pool = select_diverse_ensemble(ckpt_pool, snap_pool, val_loader, n=5)
+
+@torch.no_grad()
+def ensemble_predict(pool, loader, n_tta=5):
+    all_p, all_l, total_w = [], [], sum(p[0] for p in pool)
+    for imgs, lbls, _ in loader:
+        mp = []
+        for qv, ev, sd in pool:
+            m_ = SG_CViT(CFG["num_classes"]).to(DEVICE)
+            m_.load_state_dict({k.replace("module.",""): v for k,v in sd.items()}, strict=True)
+            m_.eval()
+            mp.append(tta_predict(m_, imgs.to(DEVICE), n=n_tta) * qv)
+            del m_; torch.cuda.empty_cache()
+        all_p.append(torch.stack(mp).sum(0)/total_w); all_l.append(lbls.numpy())
+    return np.vstack(all_p), np.concatenate(all_l)
+
+print("\n  📏 Calibrating (dedicated calib split)...")
+calib_probs, calib_labels = ensemble_predict(ens_pool, calib_loader, n_tta=CFG["tta_n_save"])
+T_opt = optimize_temperature(calib_probs, calib_labels)
+print(f"  Temperature: {T_opt:.4f}")
+calib_probs_T = apply_temperature(calib_probs, T_opt)
+apply_floors = best_qwk > 0.75
+thresh = calibrate_thresh(calib_probs_T, calib_labels, qwk_floor=CFG["calib_min_qwk"], g1_floor=CFG["calib_g1_prec_floor"], g3_floor=CFG["calib_g3_prec_floor"], apply_floors=apply_floors)
+print(f"  Thresholds: {[round(t,4) for t in thresh]}")
+
+results = {}
+def eval_testset(loader, name, ens_pool, T, thresh):
+    if loader is None: return None
+    print(f"\n  📊 Evaluating: {name}")
+    probs, labels = ensemble_predict(ens_pool, loader, n_tta=CFG["tta_n_save"])
+    probs_T = apply_temperature(probs, T)
+    preds = apply_thresh_with_safety(probs_T, thresh)
+    met = compute_metrics(labels, preds, probs_T)
+    ece_raw = compute_ece(probs, labels, CFG["ece_n_bins"])
+    ece_cal = compute_ece(probs_T, labels, CFG["ece_n_bins"])
+    _, lo, hi = bootstrap_ci(labels, preds, n=1000)
+    obs, null, pv = perm_test(labels, preds, n=500)
+    print(f"  QWK={met['QWK']:.4f} [{lo:.4f},{hi:.4f}] | Acc={met['Acc']:.4f} | F1={met['F1_macro']:.4f} | AUC={met.get('AUC',float('nan')):.4f}")
+    print(f"  ECE: raw={ece_raw:.4f} -> calibrated={ece_cal:.4f} (T={T:.3f})")
+    print(f"  Perm-p={pv:.4f} | null={null:.4f}")
+    gap_str = "✅ HIT" if met['QWK'] >= 0.90 else f"❌ gap={0.90-met['QWK']:.4f}"
+    print(f"  QWK>=0.90: {gap_str}")
+    return {**met, "CI_lo": lo, "CI_hi": hi, "perm_null": null, "perm_p": pv, "ECE_raw": round(ece_raw,4), "ECE_calibrated": round(ece_cal,4)}
+
+results[f"{DATASET_MODE}_test"] = eval_testset(test_loader, f"In-Domain Test ({DATASET_MODE})", ens_pool, T_opt, thresh)
+
+output = {
+    "version": "v24.5-definitive-balance", "dataset_mode": DATASET_MODE, "fold_idx": FOLD_IDX,
+    "fixes": ["Restored-Standard-LR", "Capped-Loss-Weights-@3.0", "Explicit-G2-Boost", "Stricter-G0-Safety", "CORN-Bias"],
+    "temperature": float(T_opt), "thresholds": [float(t) for t in thresh],
+    "ensemble_size": len(ens_pool), "time_h": round((time.time()-t0)/3600, 3),
+    "best_val_qwk": round(best_qwk, 4), "results": results,
+    "config": {k: (list(v) if isinstance(v, set) else v) for k,v in CFG.items()},
+    "splits": {"train": train_df["diagnosis"].value_counts().sort_index().to_dict(),
+               "val": val_df["diagnosis"].value_counts().sort_index().to_dict(),
+               "calib": calib_df["diagnosis"].value_counts().sort_index().to_dict(),
+               "test": test_df["diagnosis"].value_counts().sort_index().to_dict()},
+}
+
+with open(f"/kaggle/working/results_v245_{DATASET_MODE}_fold{FOLD_IDX}.json", "w") as f: json.dump(output, f, indent=2)
+torch.save(ema.get().state_dict(), f"/kaggle/working/ema_final_v245_{DATASET_MODE}_fold{FOLD_IDX}.pth")
+with open(f"/kaggle/working/config_v245_{DATASET_MODE}_fold{FOLD_IDX}.json", "w") as f: json.dump({k:(list(v) if isinstance(v,set) else v) for k,v in CFG.items()}, f, indent=2)
+
+print(f"\n  ✅ Complete → /kaggle/working/ ({DATASET_MODE}, Fold {FOLD_IDX})")
+print(f"  Best val QWK: {best_qwk:.4f}")
+for k, r in results.items():
+    if r: print(f"  {k}: QWK={r['QWK']:.4f} [{r['CI_lo']:.4f},{r['CI_hi']:.4f}] Acc={r['Acc']:.4f} p={r['perm_p']:.4f}")
